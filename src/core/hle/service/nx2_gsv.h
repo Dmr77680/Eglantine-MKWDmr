@@ -847,6 +847,7 @@ private:
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
+        LogChangedPresentWords(w);
         if (m_presents <= 4 || (m_presents % 600) == 0) {
             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
                      u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);
@@ -908,6 +909,38 @@ private:
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+    }
+
+    // Logs the 229 request words whenever one of them changes, apart from the per-frame ones
+    // (slot, image, fences): looking for the swap interval the game sets when it drops to 30 fps.
+    // Words that keep changing (more than 20 times) are treated as per-frame too.
+    std::array<u32, 48> m_present_words{};
+    std::array<u32, 48> m_present_word_changes{};
+    u32 m_present_word_logs{};
+
+    void LogChangedPresentWords(const u32* w) {
+        const size_t count = (std::min)(size_t{w[1] & 0x3ff}, m_present_words.size() - 2);
+        bool changed = m_presents <= 2;
+        for (size_t i = 2; i < 2 + count; ++i) {
+            if (w[i] == m_present_words[i]) {
+                continue;
+            }
+            const bool per_frame = i == 4 || i == 5 || i == 22 || i == 24;
+            if (!per_frame && m_present_word_changes[i] < 20) {
+                changed = true;
+                ++m_present_word_changes[i];
+            }
+            m_present_words[i] = w[i];
+        }
+        if (!changed || m_present_word_logs >= 300) {
+            return;
+        }
+        ++m_present_word_logs;
+        std::string words;
+        for (size_t i = 2; i < 2 + count; ++i) {
+            words += fmt::format(" [{}]={:#x}", i, w[i]);
+        }
+        LOG_INFO(Service, "nx2:vi2 229 present #{} words:{}", m_presents, words);
     }
 
     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
