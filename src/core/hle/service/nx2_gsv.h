@@ -874,7 +874,10 @@ private:
         const auto waited = std::chrono::steady_clock::now();
         Composite(w[5], ~w[22], w[24]);
         const auto composited = std::chrono::steady_clock::now();
-        PaceToVblank();
+        // Word 12 is (present interval << 16) | refresh rate. The game asks for 2 when it falls
+        // back to 30 fps and then moves twice as far per frame: show those frames for two vblanks.
+        const u32 swap_interval = SwapInterval(w[12]);
+        PaceToVblank(swap_interval);
         const auto paced = std::chrono::steady_clock::now();
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
         // game is blocked here while Eden's GPU thread catches up (fence) and composites.
@@ -887,6 +890,7 @@ private:
             m_stats.fence_us += to_us(waited - entered);
             m_stats.composite_us += to_us(composited - waited);
             m_stats.pace_us += to_us(paced - composited);
+            m_stats.slow_frames += swap_interval > 1 ? 1 : 0;
             m_stats.max_fence_us = (std::max)(m_stats.max_fence_us, to_us(waited - entered));
             if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
                 const long long frame = to_us(entered - m_stats.last_present);
@@ -899,10 +903,10 @@ private:
                 LOG_INFO(Service,
                          "nx2:vi2 last 600 presents: frame {} us (max {}, {} over 100 ms), "
                          "blocked on the GPU fence {} us (max {}), composite {} us, vblank "
-                         "pacing {} us",
+                         "pacing {} us, {} frames at 30 fps",
                          m_stats.frame_us / 599, m_stats.max_frame_us, m_stats.hitches,
                          m_stats.fence_us / 600, m_stats.max_fence_us, m_stats.composite_us / 600,
-                         m_stats.pace_us / 600);
+                         m_stats.pace_us / 600, m_stats.slow_frames);
                 m_stats = {.last_present = entered};
             }
         }
@@ -951,6 +955,7 @@ private:
     u32 m_wait_timeouts{};
     struct PresentStats {
         long long frame_us{}, fence_us{}, composite_us{}, pace_us{}, max_fence_us{};
+        long long slow_frames{};
         long long max_frame_us{}, hitches{};
         u32 presents{};
         std::chrono::steady_clock::time_point last_present{};
@@ -963,11 +968,25 @@ private:
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     std::chrono::steady_clock::time_point m_next_vblank{};
 
-    void PaceToVblank() {
+    // EDEN_NX2_SWAP_INTERVAL=0 ignores the game's present interval (60 Hz pacing only).
+    static u32 SwapInterval(u32 word) {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
+            return value == nullptr || value[0] != '0';
+        }();
+        const u32 interval = word >> 16;
+        if (!enabled || (word & 0xffff) != 60 || interval < 2 || interval > 4) {
+            return 1;
+        }
+        return interval;
+    }
+
+    void PaceToVblank(u32 swap_interval) {
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
             return;
         }
-        const auto interval = std::chrono::nanoseconds{100'000'000'000LL / 60 / Settings::SpeedLimit()};
+        const auto interval =
+            std::chrono::nanoseconds{100'000'000'000LL / 60 / Settings::SpeedLimit()} * swap_interval;
         const auto now = std::chrono::steady_clock::now();
         if (now > m_next_vblank + interval) {
             // Running slower than 60 fps: show at once and don't bank the lost time.
