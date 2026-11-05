@@ -434,6 +434,20 @@ struct System::Impl {
         // Expose program id to dump sites and other global readers.
         Settings::SetCurrentProgramID(params.program_id);
 
+        // Mario Kart World times its frames with the guest clock and only falls back to its
+        // 30 fps mode (present interval 2, twice the movement per frame) when it looks too slow.
+        // With the doubled clock it picks 30 fps, which the vi2 pacing holds at the right speed.
+        // Per-game value, so the configured clock comes back afterwards.
+        // EDEN_NX2_KEEP_CPU_CLOCK=1 skips this.
+        constexpr u64 MarioKartWorld = 0x0400C3F00006E000;
+        if (params.program_id == MarioKartWorld &&
+            std::getenv("EDEN_NX2_KEEP_CPU_CLOCK") == nullptr &&
+            Settings::values.cpu_clock.GetValue() != Settings::CpuClock::Overclock) {
+            LOG_INFO(Core, "Mario Kart World: doubled guest clock for its 30 fps mode");
+            Settings::values.cpu_clock.SetGlobal(false);
+            Settings::values.cpu_clock.SetValue(Settings::CpuClock::Overclock);
+        }
+
         // Track launch time for frontend launches
         LaunchTimestampCache::SaveLaunchTimestamp(params.program_id);
 
