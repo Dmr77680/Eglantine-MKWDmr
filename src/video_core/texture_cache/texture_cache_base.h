@@ -150,7 +150,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
     /// The most device memory the collector lets the cache fill before it collects in earnest,
     /// on every GPU (ApplyThresholdOverrides).
-    static constexpr u64 MaxCriticalMemory = 5_GiB;
+    // 12 GiB instead of 5: with a 5 GiB cap Mario Kart World (about 5 GB resident) kept evicting
+    // and re-uploading its textures on a 20 GB card. Cards with less memory stay under their budget.
+    static constexpr u64 MaxCriticalMemory = 12_GiB;
     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
 
     using Runtime = typename P::Runtime;
