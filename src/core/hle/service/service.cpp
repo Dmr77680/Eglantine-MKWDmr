@@ -9,6 +9,8 @@
 #include <tuple>
 #include <mutex>
 #include <map>
+#include <string>
+#include <utility>
 #include <chrono>
 #include <algorithm>
 #include <cstdlib>
@@ -67,6 +69,32 @@ void ServiceFrameworkBase::RegisterHandlersBaseTipc(const FunctionInfoBase* func
 
 void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
                                                        const FunctionInfoBase* info) {
+    // A game can call an unimplemented command every frame (Mario Kart World polls nx2:camera
+    // 29 sixty times a second): report each command a few times, then only stub it.
+    bool quiet = false;
+    {
+        static std::mutex report_mutex;
+        static std::map<std::pair<std::string, u32>, u32> report_counts;
+        std::scoped_lock report_lock{report_mutex};
+        const u32 count = ++report_counts[{std::string{service_name}, ctx.GetCommand()}];
+        quiet = count > 3;
+        if (count == 4) {
+            LOG_WARNING(Service, "{} command {} keeps being called: no longer reported",
+                        service_name, ctx.GetCommand());
+        }
+    }
+    static const bool env_auto_stub = std::getenv("EDEN_NX2_AUTO_STUB") != nullptr;
+    const auto* const caller = ctx.GetThread().GetOwnerProcess();
+    const bool auto_stub = Settings::values.use_auto_stub || env_auto_stub ||
+                           std::string_view{service_name}.starts_with(Nx2StubPrefix) ||
+                           (caller != nullptr && caller->IsSwitch2());
+    if (quiet) {
+        if (auto_stub) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultSuccess);
+        }
+        return;
+    }
     auto cmd_buf = ctx.CommandBuffer();
     std::string function_name = info == nullptr ? "<unknown>" : info->name;
 
@@ -82,11 +110,7 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
     UNIMPLEMENTED_MSG("Unknown / unimplemented {}", fmt::to_string(buf));
     // EDEN_NX2_AUTO_STUB=1 auto-stubs every unknown command without touching the config. Switch 2
     // programs are always auto-stubbed: they still call many commands nobody has implemented.
-    static const bool env_auto_stub = std::getenv("EDEN_NX2_AUTO_STUB") != nullptr;
-    const auto* const caller = ctx.GetThread().GetOwnerProcess();
-    if (Settings::values.use_auto_stub || env_auto_stub ||
-        std::string_view{service_name}.starts_with(Nx2StubPrefix) ||
-        (caller != nullptr && caller->IsSwitch2())) {
+    if (auto_stub) {
         LOG_WARNING(Service, "Using auto stub fallback!");
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
