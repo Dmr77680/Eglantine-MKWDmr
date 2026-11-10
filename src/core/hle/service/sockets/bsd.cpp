@@ -157,6 +157,19 @@ void BSD_USA::RegisterClient(HLERequestContext& ctx) {
     rb.Push<s32>(0); // bsd errno
 }
 
+// [18.0.0+] Command 36. On Switch 2 it replaces RegisterClient when bsd:s/bsd:a/bsd:u start up.
+// Input: PID, u32 version, u64 pid_reserved. Output: 4 bytes (the bsd errno, 0 = success).
+void BSD_USA::RegisterClientOunce(HLERequestContext& ctx) {
+    IPC::RequestParser rp{ctx};
+    const u32 version = rp.Pop<u32>();
+
+    LOG_WARNING(Service, "(STUBBED) called, version={}", version);
+
+    IPC::ResponseBuilder rb{ctx, 3};
+    rb.Push(ResultSuccess);
+    rb.Push<s32>(0); // bsd errno
+}
+
 void BSD_USA::StartMonitoring(HLERequestContext& ctx) {
     LOG_WARNING(Service, "(STUBBED) called");
 
@@ -1121,7 +1134,7 @@ BSD_USA::BSD_USA(Core::System& system_, const char* name, bool is_user_)
         {33, nullptr, "RegisterClientShared"}, //10.0.0+
         {34, nullptr, "GetSocketStatistics"}, //15.0.0+
         {35, nullptr, "NifIoctl"}, //17.0.0+
-        {36, nullptr, "Unknown36"}, //18.0.0+
+        {36, &BSD_USA::RegisterClientOunce, "RegisterClientOunce"}, //18.0.0+
         {37, nullptr, "Unknown37"}, //18.0.0+
         {38, nullptr, "Unknown38"}, //18.0.0+
         {39, nullptr, "Unknown39"}, //20.0.0+

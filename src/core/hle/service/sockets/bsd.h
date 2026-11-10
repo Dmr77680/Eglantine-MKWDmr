@@ -128,6 +128,7 @@ private:
     };
 
     void RegisterClient(HLERequestContext& ctx);
+    void RegisterClientOunce(HLERequestContext& ctx);
     void StartMonitoring(HLERequestContext& ctx);
     void Socket(HLERequestContext& ctx);
     void SocketExempt(HLERequestContext& ctx);
