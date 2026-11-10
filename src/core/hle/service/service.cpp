@@ -201,6 +201,20 @@ void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
     if (ipc_trace) {
         LOG_INFO(Service, "ipc {}::{} ({})", service_name, ctx.GetCommand(), info->name);
     }
+    if (Core::g_online_dump_armed_ns.load(std::memory_order_relaxed) != 0) {
+        // [ONLINE] Once the game has looked up its NPLN server, log its network calls (but the
+        // Polls, which come back every 100 ms) with the guest thread that made them.
+        const std::string_view name{service_name};
+        const bool network = name.starts_with("bsd") || name.starts_with("sfdnsres") ||
+                             name.starts_with("ssl") || name.starts_with("ISsl") ||
+                             name.starts_with("nifm") || name == "IGeneralService" ||
+                             name == "IRequest";
+        const bool poll = name.starts_with("bsd") && ctx.GetCommand() == 6;
+        if (network && !poll) {
+            LOG_INFO(Service, "[ONLINE] ipc t{} {}::{} ({})", ctx.GetThread().GetThreadId(),
+                     service_name, ctx.GetCommand(), info->name);
+        }
+    }
     handler_invoker(this, info->handler_callback, ctx);
     if (ipc_trace) {
         // Response layout: [0..1] header, then 'SFCO', version, result.

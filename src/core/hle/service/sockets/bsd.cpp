@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1449,6 +1450,19 @@ std::optional<std::pair<s32, Errno>> BSD_USA::PollImpl(HLERequestContext& ctx,
         std::memcpy(request->pollfds.data(), read_buffer.data(), size);
         if (timeout >= 0) {
             request->deadline = SelectClock::now() + std::chrono::milliseconds{timeout};
+        } else {
+            // [ONLINE] A Poll with no timeout holds a session of the game's socket library until
+            // it ends. Mario Kart World's gRPC dispatcher polls its eventfd so, while the threads
+            // that would write the eventfd wait for that session: nothing ever ends the Poll.
+            // Coming back with nothing ready now and then lets them through; the game polls
+            // again. NX2_POLL_CAP_MS=<ms> sets the delay (100 by default), 0 turns it off.
+            static const s64 cap_ms = [] {
+                const char* text = std::getenv("NX2_POLL_CAP_MS");
+                return text != nullptr && *text != '\0' ? std::strtoll(text, nullptr, 10) : s64{100};
+            }();
+            if (cap_ms > 0) {
+                request->deadline = SelectClock::now() + std::chrono::milliseconds{cap_ms};
+            }
         }
     }
     std::vector<PollFD> fds = request->pollfds;
@@ -1563,6 +1577,19 @@ std::optional<std::pair<s32, Errno>> BSD_USA::PollImpl(HLERequestContext& ctx,
         return std::nullopt;
     }
 
+    if (count == 0 && timeout == -1) {
+        // [ONLINE] The capped Poll with no timeout ended with nothing ready.
+        static std::atomic<u64> capped_polls{0};
+        const u64 n = ++capped_polls;
+        if (n <= 5 || n % 200 == 0) {
+            std::string fd_list;
+            for (const PollFD& pollfd : fds) {
+                fd_list += fmt::format(" {}", pollfd.fd);
+            }
+            LOG_INFO(Service, "[ONLINE] Poll with no timeout (fds{}) came back after the cap, {} so far",
+                     fd_list, n);
+        }
+    }
     write_buffer.resize(fds.size() * sizeof(PollFD));
     std::memcpy(write_buffer.data(), fds.data(), write_buffer.size());
     return Outcome{count, Errno::SUCCESS};
