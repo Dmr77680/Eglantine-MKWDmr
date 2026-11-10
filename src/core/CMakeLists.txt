@@ -142,6 +142,8 @@ add_library(core STATIC
     file_sys/sdmc_factory.h
     file_sys/submission_package.cpp
     file_sys/submission_package.h
+    file_sys/nup_container.cpp
+    file_sys/nup_container.h
     file_sys/system_archive/data/font_chinese_simplified.cpp
     file_sys/system_archive/data/font_chinese_simplified.h
     file_sys/system_archive/data/font_chinese_traditional.cpp
@@ -1154,6 +1156,8 @@ add_library(core STATIC
     loader/nso.h
     loader/nsp.cpp
     loader/nsp.h
+    loader/nup.cpp
+    loader/nup.h
     loader/xci.cpp
     loader/xci.h
     memory.cpp

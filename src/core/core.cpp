@@ -24,6 +24,7 @@
 #include "core/debugger/debugger.h"
 #include "core/device_memory.h"
 #include "core/file_sys/fs_filesystem.h"
+#include "core/file_sys/nup_container.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/program_metadata.h"
 #include "core/file_sys/registered_cache.h"
@@ -115,6 +116,22 @@ namespace {
 
 // Switch 2 titles boot as a loose ExeFS, with main.npdm next to main.
 bool IsSwitch2Program(const FileSys::VirtualFile& file) {
+    if (file != nullptr && FileSys::NupContainer::IsNupFile(file)) {
+        FileSys::NupContainer nup{file};
+        if (nup.GetStatus() != Loader::ResultStatus::Success) {
+            return false;
+        }
+        auto package = nup.FindBestUpdatePackage();
+        if (!package.has_value() || nup.GetExeFSDir(*package) == nullptr) {
+            package = nup.FindBasePackage();
+        }
+        const auto exefs = package.has_value() ? nup.GetExeFSDir(*package) : nullptr;
+        const auto nup_npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
+        FileSys::ProgramMetadata nup_metadata;
+        return nup_npdm != nullptr &&
+               nup_metadata.Load(nup_npdm) == Loader::ResultStatus::Success &&
+               nup_metadata.IsSwitch2();
+    }
     const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
     const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
     FileSys::ProgramMetadata metadata;
