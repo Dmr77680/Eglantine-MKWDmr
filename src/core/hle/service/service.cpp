@@ -24,6 +24,7 @@
 #include "core/hle/ipc.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/service.h"
@@ -193,6 +194,10 @@ void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
     LOG_TRACE(Service, "{}", MakeFunctionString(info->name, GetServiceName(), ctx.CommandBuffer()));
     // EDEN_NX2_IPC_TRACE=1 logs every dispatched command and the result word it returned.
     static const bool ipc_trace = std::getenv("EDEN_NX2_IPC_TRACE") != nullptr;
+    if (Core::OnlineWatchActive()) {
+        Core::OnlineNote(true, ctx.GetThread().GetThreadId(),
+                         fmt::format("{}::{} ({})", service_name, ctx.GetCommand(), info->name));
+    }
     if (ipc_trace) {
         LOG_INFO(Service, "ipc {}::{} ({})", service_name, ctx.GetCommand(), info->name);
     }
@@ -220,6 +225,10 @@ void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
 
     LOG_TRACE(Service, "{}", MakeFunctionString(info->name, GetServiceName(), ctx.CommandBuffer()));
     static const bool ipc_trace = std::getenv("EDEN_NX2_IPC_TRACE") != nullptr;
+    if (Core::OnlineWatchActive()) {
+        Core::OnlineNote(true, ctx.GetThread().GetThreadId(),
+                         fmt::format("{}::{} ({})", service_name, ctx.GetCommand(), info->name));
+    }
     if (ipc_trace) {
         const auto* w = ctx.CommandBuffer();
         LOG_INFO(Service, "tipc {}::{} ({}) [2]={:#x} [3]={:#x} [4]={:#x}", service_name,

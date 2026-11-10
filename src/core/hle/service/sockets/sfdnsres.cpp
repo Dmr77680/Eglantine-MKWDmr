@@ -115,6 +115,7 @@ static std::string RedirectOnlineHost(const std::string& host) {
     const char* env = std::getenv("NX2_ONLINE_SERVER");
     const std::string target = (env != nullptr && *env != '\0') ? env : "127.0.0.1";
     LOG_INFO(Network, "[ONLINE] {} -> {}", host, target);
+    Core::OnlineArmThreadDump();
     return target;
 }
 
