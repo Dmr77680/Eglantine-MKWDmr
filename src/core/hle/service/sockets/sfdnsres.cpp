@@ -312,6 +312,36 @@ static std::vector<u8> SerializeAddrInfo(const std::vector<Network::AddrInfo>& v
     return data;
 }
 
+// A console's getaddrinfo answers with the socket type and protocol asked for in the hints; the
+// host's leaves them at 0 (Windows always does), and games then find no usable address.
+// Switch values: SOCK_STREAM 1, SOCK_DGRAM 2, IPPROTO_TCP 6, IPPROTO_UDP 17.
+static void FillConsoleSocketKinds(std::vector<Network::AddrInfo>& results, u32 hint_socktype,
+                                   u32 hint_protocol) {
+    const bool type_hinted = hint_socktype == 1 || hint_socktype == 2;
+    const Network::Type wanted_type =
+        hint_socktype == 2 ? Network::Type::DGRAM : Network::Type::STREAM;
+    std::erase_if(results, [&](const Network::AddrInfo& info) {
+        return type_hinted && info.socket_type != Network::Type::Unspecified &&
+               info.socket_type != wanted_type;
+    });
+    for (auto& info : results) {
+        if (info.socket_type == Network::Type::Unspecified) {
+            info.socket_type = wanted_type;
+        }
+        if (info.protocol == Network::Protocol::Unspecified ||
+            info.protocol == Network::Protocol::IP) {
+            if (hint_protocol == 6) {
+                info.protocol = Network::Protocol::TCP;
+            } else if (hint_protocol == 17) {
+                info.protocol = Network::Protocol::UDP;
+            } else {
+                info.protocol = info.socket_type == Network::Type::DGRAM ? Network::Protocol::UDP
+                                                                         : Network::Protocol::TCP;
+            }
+        }
+    }
+}
+
 static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext& ctx) {
     struct InputParameters {
         u8 use_nsd_resolve;
@@ -346,10 +376,29 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
         service = Common::StringFromBuffer(service_buffer);
     }
 
-    // Serialized hints are also passed in a buffer, but are ignored for now.
+    // Serialized hints come in the third buffer, big-endian: magic 0xBEEFCAFE, ai_flags,
+    // ai_family, ai_socktype, ai_protocol (read without the magic if it is missing).
+    u32 hint_socktype = 0;
+    u32 hint_protocol = 0;
+    if (ctx.CanReadBuffer(2)) {
+        const std::span<const u8> hints_buffer = ctx.ReadBuffer(2);
+        const auto read_be = [&hints_buffer](std::size_t offset) -> u32 {
+            if (offset + 4 > hints_buffer.size()) {
+                return 0;
+            }
+            return (u32{hints_buffer[offset]} << 24) | (u32{hints_buffer[offset + 1]} << 16) |
+                   (u32{hints_buffer[offset + 2]} << 8) | u32{hints_buffer[offset + 3]};
+        };
+        const std::size_t base = read_be(0) == 0xBEEFCAFE ? 4 : 0;
+        hint_socktype = read_be(base + 8);
+        hint_protocol = read_be(base + 12);
+    }
 
     auto res_v = Network::GetAddressInfo(host, service);
     if (auto* res = std::get_if<std::vector<Network::AddrInfo>>(&res_v)) {
+        FillConsoleSocketKinds(*res, hint_socktype, hint_protocol);
+        LOG_INFO(Network, "[ONLINE] getaddrinfo {} : hints socktype={} protocol={}, {} result(s)",
+                 host, hint_socktype, hint_protocol, res->size());
         const std::vector<u8> data = SerializeAddrInfo(*res, host);
         const u32 data_size = u32(data.size());
         ctx.WriteBuffer(data, 0);
