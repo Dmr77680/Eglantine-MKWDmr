@@ -1,0 +1,101 @@
+name: build-online
+
+on:
+  push:
+    branches:
+      - online
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-online-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x86_64 (clang-cl) - online
+    runs-on: windows-2022
+    timeout-minutes: 350
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache CPM downloads
+        uses: actions/cache@v4
+        with:
+          path: .cache/cpm
+          key: cpm-online-${{ runner.os }}-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            cpm-online-${{ runner.os }}-
+
+      - name: Configure
+        shell: bash
+        run: >-
+          cmake -S . -B build/release -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER=clang-cl
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DBUILD_TESTING=OFF
+          -DYUZU_TESTS=OFF
+          -DYUZU_CMD=OFF
+          -DYUZU_ROOM=OFF
+          -DYUZU_ROOM_STANDALONE=OFF
+          -DYUZU_USE_BUNDLED_QT=OFF
+          -DYUZU_USE_BUNDLED_SDL3=ON
+          -DENABLE_UPDATE_CHECKER=OFF
+          -DUSE_DISCORD_PRESENCE=OFF
+          -DENABLE_WERROR=OFF
+
+      - name: Build
+        shell: bash
+        run: cmake --build build/release --target yuzu --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          if (-not (Test-Path build/release/bin/eglantine.exe)) {
+            throw 'build/release/bin/eglantine.exe was not produced'
+          }
+          windeployqt --release --no-translations --no-compiler-runtime build/release/bin/eglantine.exe
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: eglantine-online-${{ github.sha }}
+          path: build/release/bin/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
