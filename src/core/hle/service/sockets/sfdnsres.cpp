@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -100,6 +102,20 @@ static bool IsBlockedHost(const std::string& host) {
     return std::any_of(
         blockedDomains.begin(), blockedDomains.end(),
         [&host](const std::string& domain) { return host.find(domain) != std::string::npos; });
+}
+
+// Online Switch 2: the game's NPLN servers (*.npln.srv.nintendo.net) go to our own server
+// instead of being blocked. Address from NX2_ONLINE_SERVER, else this PC (127.0.0.1).
+static std::string RedirectOnlineHost(const std::string& host) {
+    static constexpr std::string_view npln_suffix = ".npln.srv.nintendo.net";
+    if (host.size() <= npln_suffix.size() ||
+        host.compare(host.size() - npln_suffix.size(), npln_suffix.size(), npln_suffix) != 0) {
+        return host;
+    }
+    const char* env = std::getenv("NX2_ONLINE_SERVER");
+    const std::string target = (env != nullptr && *env != '\0') ? env : "127.0.0.1";
+    LOG_INFO(Network, "[ONLINE] {} -> {}", host, target);
+    return target;
 }
 
 static NetDbError GetAddrInfoErrorToNetDbError(GetAddrInfoError result) {
@@ -199,7 +215,7 @@ static std::pair<u32, GetAddrInfoError> GetHostByNameRequestImpl(HLERequestConte
         parameters.use_nsd_resolve, parameters.cancel_handle, parameters.process_id);
 
     const auto host_buffer = ctx.ReadBuffer(0);
-    const std::string host = Common::StringFromBuffer(host_buffer);
+    const std::string host = RedirectOnlineHost(Common::StringFromBuffer(host_buffer));
     // For now, ignore options, which are in input buffer 1 for GetHostByNameRequestWithOptions.
 
     // Prevent resolution of Nintendo servers
@@ -316,7 +332,7 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
     // before looking up.
 
     const auto host_buffer = ctx.ReadBuffer(0);
-    const std::string host = Common::StringFromBuffer(host_buffer);
+    const std::string host = RedirectOnlineHost(Common::StringFromBuffer(host_buffer));
 
     // Prevent resolution of Nintendo servers
     if (IsBlockedHost(host)) {
