@@ -15,8 +15,8 @@ concurrency:
 
 jobs:
   build:
-    name: Windows x86_64 (clang-cl) - online
-    runs-on: windows-2022
+    name: Windows x86_64 (MSVC) - online
+    runs-on: windows-2025
     timeout-minutes: 350
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -60,8 +60,6 @@ jobs:
         run: >-
           cmake -S . -B build/release -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_C_COMPILER=clang-cl
-          -DCMAKE_CXX_COMPILER=clang-cl
           -DCMAKE_C_COMPILER_LAUNCHER=sccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           -DBUILD_TESTING=OFF
