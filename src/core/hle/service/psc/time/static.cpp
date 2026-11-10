@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -190,6 +191,20 @@ Result StaticService::IsStandardNetworkSystemClockAccuracySufficient(Out<bool> o
     };
 
     *out_is_sufficient = m_network_system_clock.IsAccuracySufficient();
+    if (!*out_is_sufficient) {
+        // No time server to sync with: take the local clock's time, as a successful sync would.
+        s64 now{};
+        if (m_local_system_clock.GetCurrentTime(&now) != ResultSuccess) {
+            now = std::chrono::duration_cast<std::chrono::seconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+        }
+        if (m_network_system_clock.SetCurrentTime(now) == ResultSuccess) {
+            *out_is_sufficient = m_network_system_clock.IsAccuracySufficient();
+        }
+        LOG_INFO(Service_Time, "[ONLINE] network clock synced to the local clock ({}), sufficient={}",
+                 now, *out_is_sufficient);
+    }
 
     R_SUCCEED();
 }
