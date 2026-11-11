@@ -1063,6 +1063,13 @@ std::pair<SocketBase::AcceptResult, Errno> Socket::Accept() {
 }
 
 Errno Socket::Connect(SockAddrIn addr_in) {
+    {
+        static std::atomic<int> connects{0};
+        if (connects.fetch_add(1) < 60) {
+            LOG_INFO(Network, "[ONLINE] connect to {}.{}.{}.{}:{}", addr_in.ip[0], addr_in.ip[1],
+                     addr_in.ip[2], addr_in.ip[3], addr_in.portno);
+        }
+    }
     const sockaddr host_addr_in = TranslateFromSockAddrIn(addr_in);
     if (connect(fd, &host_addr_in, sizeof(host_addr_in)) != SOCKET_ERROR) {
         return Errno::SUCCESS;
@@ -1420,7 +1427,7 @@ std::pair<s32, Errno> Socket::SendTo(u32 flags, std::span<const u8> message,
         }
     }
 
-    if (addr) {
+    if (addr && addr->portno != 0) {
         static std::atomic<int> udp_sends{0};
         if (udp_sends.fetch_add(1) < 150) {
             std::string head;
