@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -894,6 +895,9 @@ Errno Socket::SetSockOpt(SOCKET fd_so, int level, int option, T value) {
 
 Errno Socket::Initialize(Domain domain, Type type, Protocol protocol) {
     fd = socket(TranslateDomainToNative(domain), TranslateTypeToNative(type), TranslateProtocolToNative(protocol));
+    LOG_INFO(Network, "[ONLINE] new host socket: domain={} type={} protocol={} ({})",
+             static_cast<u32>(domain), static_cast<u32>(type), static_cast<u32>(protocol),
+             fd != INVALID_SOCKET ? "ok" : "failed");
     if (fd != INVALID_SOCKET) {
         return Errno::SUCCESS;
     }
@@ -1104,6 +1108,22 @@ std::pair<s32, Errno> Socket::RecvFrom(int flags, std::span<u8> message, SockAdd
             return {static_cast<s32>(result), Errno::SUCCESS};
         }
 
+#ifdef _WIN32
+        // [ONLINE] Windows will not receive on a raw socket that was never bound; a console does.
+        if (WSAGetLastError() == WSAEINVAL) {
+            int sock_type = 0;
+            int sock_type_len = sizeof(sock_type);
+            if (getsockopt(fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&sock_type),
+                           &sock_type_len) == 0 &&
+                sock_type == SOCK_RAW) {
+                static std::atomic<int> raw_receives{0};
+                if (raw_receives.fetch_add(1) < 3) {
+                    LOG_INFO(Network, "[ONLINE] raw receive on an unbound socket: no data yet");
+                }
+                return {-1, Errno::AGAIN};
+            }
+        }
+#endif
         return {-1, GetAndLogLastError()};
     });
 }
@@ -1190,6 +1210,30 @@ std::pair<s32, Errno> Socket::SendTo(u32 flags, std::span<const u8> message,
     if (addr) {
         host_addr_in = TranslateFromSockAddrIn(*addr);
         to = &host_addr_in;
+    }
+
+    {
+        int sock_type = 0;
+        socklen_t sock_type_len = sizeof(sock_type);
+        if (getsockopt(fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&sock_type),
+                       &sock_type_len) == 0 &&
+            sock_type == SOCK_RAW) {
+            static std::atomic<int> raw_sends{0};
+            if (raw_sends.fetch_add(1) < 20) {
+                std::string head;
+                for (std::size_t i = 0; i < message.size() && i < 24; ++i) {
+                    head += fmt::format("{:02x}", message[i]);
+                }
+                if (addr) {
+                    LOG_INFO(Network, "[ONLINE] raw send: {} bytes to {}.{}.{}.{}:{} data={}",
+                             message.size(), addr->ip[0], addr->ip[1], addr->ip[2], addr->ip[3],
+                             addr->portno, head);
+                } else {
+                    LOG_INFO(Network, "[ONLINE] raw send: {} bytes (no address) data={}",
+                             message.size(), head);
+                }
+            }
+        }
     }
 
     return Transfer(static_cast<int>(flags), [&](int host_flags) -> std::pair<s32, Errno> {
