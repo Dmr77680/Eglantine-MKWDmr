@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <limits>
+#include <map>
 #include <mutex>
+#include <thread>
 #include <set>
 #include <string>
 #include <utility>
@@ -19,6 +22,8 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <icmpapi.h>
 #else
 #include <arpa/inet.h>
 #include <errno.h>
@@ -896,6 +901,97 @@ Errno Socket::SetSockOpt(SOCKET fd_so, int level, int option, T value) {
 }
 
 #ifdef _WIN32
+namespace {
+struct IcmpReply {
+    std::vector<u8> data;
+    sockaddr_in from{};
+};
+std::mutex icmp_mutex;
+std::map<SOCKET, std::deque<IcmpReply>> icmp_replies;
+
+u16 InternetChecksum(const u8* d, size_t n) {
+    u32 sum = 0;
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        sum += (static_cast<u32>(d[i]) << 8) | d[i + 1];
+    }
+    if (n & 1) {
+        sum += static_cast<u32>(d[n - 1]) << 8;
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    return static_cast<u16>(~sum);
+}
+
+void StartIcmpEcho(SOCKET s, u32 dest_net_order, std::vector<u8> msg) {
+    std::thread([s, dest_net_order, msg = std::move(msg)] {
+        HANDLE h = IcmpCreateFile();
+        if (h == INVALID_HANDLE_VALUE) {
+            LOG_WARNING(Network, "[ONLINE] icmp echo: IcmpCreateFile failed {}", GetLastError());
+            return;
+        }
+        const DWORD plen = msg.size() > 8 ? static_cast<DWORD>(msg.size() - 8) : 0;
+        std::vector<u8> buf(sizeof(ICMP_ECHO_REPLY) + plen + 64);
+        const DWORD n = IcmpSendEcho(h, dest_net_order, plen ? const_cast<u8*>(msg.data() + 8) : nullptr,
+                                     static_cast<WORD>(plen), nullptr, buf.data(),
+                                     static_cast<DWORD>(buf.size()), 1500);
+        u8 ttl = 64;
+        if (n > 0) {
+            ttl = reinterpret_cast<ICMP_ECHO_REPLY*>(buf.data())->Options.Ttl;
+        }
+        IcmpCloseHandle(h);
+        LOG_INFO(Network, "[ONLINE] icmp echo seq={} -> {}", (msg.size() >= 8 ? (msg[6] << 8 | msg[7]) : 0),
+                 n > 0 ? "reply" : "no reply");
+        if (n == 0) {
+            return;
+        }
+        std::vector<u8> pkt(20 + msg.size());
+        pkt[0] = 0x45;
+        pkt[2] = static_cast<u8>(pkt.size() >> 8);
+        pkt[3] = static_cast<u8>(pkt.size());
+        pkt[8] = ttl;
+        pkt[9] = 1;
+        std::memcpy(&pkt[12], &dest_net_order, 4);
+        std::memcpy(&pkt[20], msg.data(), msg.size());
+        pkt[20] = 0; // echo reply
+        pkt[22] = pkt[23] = 0;
+        const u16 ic = InternetChecksum(&pkt[20], msg.size());
+        pkt[22] = static_cast<u8>(ic >> 8);
+        pkt[23] = static_cast<u8>(ic);
+        const u16 hc = InternetChecksum(pkt.data(), 20);
+        pkt[10] = static_cast<u8>(hc >> 8);
+        pkt[11] = static_cast<u8>(hc);
+        IcmpReply reply;
+        reply.data = std::move(pkt);
+        reply.from.sin_family = AF_INET;
+        reply.from.sin_addr.s_addr = dest_net_order;
+        std::lock_guard lock{icmp_mutex};
+        const auto it = icmp_replies.find(s);
+        if (it != icmp_replies.end()) {
+            it->second.push_back(std::move(reply));
+        }
+    }).detach();
+}
+
+bool PopIcmpReply(SOCKET s, std::span<u8> message, sockaddr_in& from, s32& size) {
+    std::lock_guard lock{icmp_mutex};
+    const auto it = icmp_replies.find(s);
+    if (it == icmp_replies.end() || it->second.empty()) {
+        return false;
+    }
+    IcmpReply reply = std::move(it->second.front());
+    it->second.pop_front();
+    const size_t n = std::min(reply.data.size(), message.size());
+    std::memcpy(message.data(), reply.data.data(), n);
+    from = reply.from;
+    size = static_cast<s32>(n);
+    LOG_INFO(Network, "[ONLINE] icmp reply given to the game: {} bytes", n);
+    return true;
+}
+} // namespace
+#endif
+
+#ifdef _WIN32
 // [ONLINE] Windows only delivers data to a raw socket once it is bound; a console does not need it.
 static void BindRawSocketOnce(SOCKET raw_fd) {
     static std::mutex bound_mutex;
@@ -1101,6 +1197,15 @@ std::pair<s32, Errno> Socket::Recv(int flags, std::span<u8> message) {
     ASSERT(message.size() < static_cast<size_t>((std::numeric_limits<int>::max)()));
 
     return Transfer(flags, [&](int host_flags) -> std::pair<s32, Errno> {
+#ifdef _WIN32
+        {
+            sockaddr_in from{};
+            s32 got = 0;
+            if (PopIcmpReply(fd, message, from, got)) {
+                return {got, Errno::SUCCESS};
+            }
+        }
+#endif
         const auto result = recv(fd, reinterpret_cast<char*>(message.data()),
                                  static_cast<int>(message.size()), host_flags);
         if (result != SOCKET_ERROR) {
@@ -1121,6 +1226,18 @@ std::pair<s32, Errno> Socket::RecvFrom(int flags, std::span<u8> message, SockAdd
         socklen_t* const p_addrlen = addr ? &addrlen : nullptr;
         sockaddr* const p_addr_in = addr ? reinterpret_cast<sockaddr*>(&addr_in) : nullptr;
 
+#ifdef _WIN32
+        {
+            sockaddr_in from{};
+            s32 got = 0;
+            if (PopIcmpReply(fd, message, from, got)) {
+                if (addr) {
+                    *addr = TranslateToSockAddrIn(from, sizeof(from));
+                }
+                return {got, Errno::SUCCESS};
+            }
+        }
+#endif
         const auto result =
             recvfrom(fd, reinterpret_cast<char*>(message.data()),
                      static_cast<int>(message.size()), host_flags, p_addr_in, p_addrlen);
@@ -1265,6 +1382,15 @@ std::pair<s32, Errno> Socket::SendTo(u32 flags, std::span<const u8> message,
             sock_type == SOCK_RAW) {
 #ifdef _WIN32
             BindRawSocketOnce(fd);
+            if (addr && !message.empty() && message[0] == 8) {
+                {
+                    std::lock_guard lock{icmp_mutex};
+                    icmp_replies.try_emplace(fd);
+                }
+                u32 dest;
+                std::memcpy(&dest, addr->ip.data(), 4);
+                StartIcmpEcho(fd, dest, std::vector<u8>(message.begin(), message.end()));
+            }
 #endif
             static std::atomic<int> raw_sends{0};
             if (raw_sends.fetch_add(1) < 20) {
@@ -1296,6 +1422,12 @@ std::pair<s32, Errno> Socket::SendTo(u32 flags, std::span<const u8> message,
 }
 
 Errno Socket::Close() {
+#ifdef _WIN32
+    {
+        std::lock_guard lock{icmp_mutex};
+        icmp_replies.erase(fd);
+    }
+#endif
     [[maybe_unused]] const int result = closesocket(fd);
     if (result != 0) {
         LOG_WARNING(Network, "closesocket failed, socket may already be closed");
