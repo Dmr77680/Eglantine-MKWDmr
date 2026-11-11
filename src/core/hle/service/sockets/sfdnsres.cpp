@@ -5,11 +5,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "common/fs/path_util.h"
 #include "common/string_util.h"
 #include "common/swap.h"
 #include "core/core.h"
@@ -104,6 +107,45 @@ static bool IsBlockedHost(const std::string& host) {
         [&host](const std::string& domain) { return host.find(domain) != std::string::npos; });
 }
 
+// Address of the online server. NX2_ONLINE_SERVER wins when set; otherwise the first line of
+// online_server.txt in the config folder (created with the default on first launch, so it can be
+// changed once by editing that one line); otherwise the built-in default.
+static constexpr const char* kDefaultOnlineServer = "2.29.165.22";
+
+static std::string OnlineServerAddress() {
+    static const std::string address = []() -> std::string {
+        if (const char* env = std::getenv("NX2_ONLINE_SERVER"); env != nullptr && *env != '\0') {
+            return std::string(env);
+        }
+        const auto file =
+            Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "online_server.txt";
+        std::string value;
+        {
+            std::ifstream in(file);
+            std::string line;
+            while (std::getline(in, line)) {
+                const auto first = line.find_first_not_of(" \t\r\n");
+                if (first == std::string::npos) {
+                    continue;
+                }
+                const auto last = line.find_last_not_of(" \t\r\n");
+                value = line.substr(first, last - first + 1);
+                break;
+            }
+        }
+        if (value.empty()) {
+            value = kDefaultOnlineServer;
+            std::ofstream out(file);
+            if (out) {
+                out << value << "\n";
+            }
+        }
+        LOG_INFO(Network, "[ONLINE] server address {} (file {})", value, file.string());
+        return value;
+    }();
+    return address;
+}
+
 // Online Switch 2: the game's NPLN servers (*.npln.srv.nintendo.net) go to our own server
 // instead of being blocked. Address from NX2_ONLINE_SERVER, else this PC (127.0.0.1).
 static std::string RedirectOnlineHost(const std::string& raw_host) {
@@ -123,8 +165,7 @@ static std::string RedirectOnlineHost(const std::string& raw_host) {
     if (!npln && !nncs && !pserver) {
         return host;
     }
-    const char* env = std::getenv("NX2_ONLINE_SERVER");
-    const std::string target = (env != nullptr && *env != '\0') ? env : "127.0.0.1";
+    const std::string target = OnlineServerAddress();
     LOG_INFO(Network, "[ONLINE] {} -> {}", host, target);
     Core::OnlineArmThreadDump();
     return target;
