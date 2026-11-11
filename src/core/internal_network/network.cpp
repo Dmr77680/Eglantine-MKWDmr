@@ -8,6 +8,8 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -893,6 +895,27 @@ Errno Socket::SetSockOpt(SOCKET fd_so, int level, int option, T value) {
     return GetAndLogLastError();
 }
 
+#ifdef _WIN32
+// [ONLINE] Windows only delivers data to a raw socket once it is bound; a console does not need it.
+static void BindRawSocketOnce(SOCKET raw_fd) {
+    static std::mutex bound_mutex;
+    static std::set<SOCKET> bound;
+    std::lock_guard lock{bound_mutex};
+    if (!bound.insert(raw_fd).second) {
+        return;
+    }
+    sockaddr_in any{};
+    any.sin_family = AF_INET;
+    any.sin_addr.s_addr = htonl(INADDR_ANY);
+    any.sin_port = 0;
+    if (bind(raw_fd, reinterpret_cast<const sockaddr*>(&any), sizeof(any)) == 0) {
+        LOG_INFO(Network, "[ONLINE] raw socket bound (0.0.0.0)");
+    } else {
+        LOG_WARNING(Network, "[ONLINE] raw socket bind failed: {}", WSAGetLastError());
+    }
+}
+#endif
+
 Errno Socket::Initialize(Domain domain, Type type, Protocol protocol) {
     fd = socket(TranslateDomainToNative(domain), TranslateTypeToNative(type), TranslateProtocolToNative(protocol));
     LOG_INFO(Network, "[ONLINE] new host socket: domain={} type={} protocol={} ({})",
@@ -1116,9 +1139,31 @@ std::pair<s32, Errno> Socket::RecvFrom(int flags, std::span<u8> message, SockAdd
             if (getsockopt(fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&sock_type),
                            &sock_type_len) == 0 &&
                 sock_type == SOCK_RAW) {
+                BindRawSocketOnce(fd);
+                const auto retry =
+                    recvfrom(fd, reinterpret_cast<char*>(message.data()),
+                             static_cast<int>(message.size()), host_flags, p_addr_in, p_addrlen);
+                if (retry != SOCKET_ERROR) {
+                    if (addr) {
+                        *addr = TranslateToSockAddrIn(addr_in, addrlen);
+                    }
+                    static std::atomic<int> raw_ok{0};
+                    if (raw_ok.fetch_add(1) < 10) {
+                        std::string head;
+                        for (int i = 0; i < retry && i < 32; ++i) {
+                            head += fmt::format("{:02x}", message[i]);
+                        }
+                        LOG_INFO(Network, "[ONLINE] raw receive: {} bytes data={}", retry, head);
+                    }
+                    return {static_cast<s32>(retry), Errno::SUCCESS};
+                }
+                if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                    return {-1, Errno::AGAIN};
+                }
                 static std::atomic<int> raw_receives{0};
                 if (raw_receives.fetch_add(1) < 3) {
-                    LOG_INFO(Network, "[ONLINE] raw receive on an unbound socket: no data yet");
+                    LOG_INFO(Network, "[ONLINE] raw receive: no data yet (error {})",
+                             WSAGetLastError());
                 }
                 return {-1, Errno::AGAIN};
             }
@@ -1218,6 +1263,9 @@ std::pair<s32, Errno> Socket::SendTo(u32 flags, std::span<const u8> message,
         if (getsockopt(fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&sock_type),
                        &sock_type_len) == 0 &&
             sock_type == SOCK_RAW) {
+#ifdef _WIN32
+            BindRawSocketOnce(fd);
+#endif
             static std::atomic<int> raw_sends{0};
             if (raw_sends.fetch_add(1) < 20) {
                 std::string head;
