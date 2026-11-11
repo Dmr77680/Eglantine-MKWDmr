@@ -1244,6 +1244,16 @@ std::pair<s32, Errno> Socket::RecvFrom(int flags, std::span<u8> message, SockAdd
         if (result != SOCKET_ERROR) {
             if (addr) {
                 *addr = TranslateToSockAddrIn(addr_in, addrlen);
+                static std::atomic<int> udp_recvs{0};
+                if (udp_recvs.fetch_add(1) < 150) {
+                    std::string head;
+                    for (int i = 0; i < result && i < 20; ++i) {
+                        head += fmt::format("{:02x}", message[i]);
+                    }
+                    LOG_INFO(Network, "[ONLINE] udp recv: {} bytes from {}.{}.{}.{}:{} data={}",
+                             result, addr->ip[0], addr->ip[1], addr->ip[2], addr->ip[3],
+                             addr->portno, head);
+                }
             }
             return {static_cast<s32>(result), Errno::SUCCESS};
         }
@@ -1407,6 +1417,19 @@ std::pair<s32, Errno> Socket::SendTo(u32 flags, std::span<const u8> message,
                              message.size(), head);
                 }
             }
+        }
+    }
+
+    if (addr) {
+        static std::atomic<int> udp_sends{0};
+        if (udp_sends.fetch_add(1) < 150) {
+            std::string head;
+            for (std::size_t i = 0; i < message.size() && i < 20; ++i) {
+                head += fmt::format("{:02x}", message[i]);
+            }
+            LOG_INFO(Network, "[ONLINE] udp send: {} bytes to {}.{}.{}.{}:{} data={}",
+                     message.size(), addr->ip[0], addr->ip[1], addr->ip[2], addr->ip[3],
+                     addr->portno, head);
         }
     }
 
