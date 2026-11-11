@@ -144,7 +144,7 @@ struct Values {
                                                Category::LibraryApplet};
     Setting<AppletMode> data_erase_applet_mode{linkage, AppletMode::HLE, "data_erase_applet_mode",
                                                Category::LibraryApplet};
-    SwitchableSetting<AppletMode> error_applet_mode{linkage, AppletMode::LLE, "error_applet_mode",
+    SwitchableSetting<AppletMode> error_applet_mode{linkage, AppletMode::HLE, "error_applet_mode",
                                           Category::LibraryApplet};
     Setting<AppletMode> net_connect_applet_mode{linkage, AppletMode::LLE, "net_connect_applet_mode",
                                                 Category::LibraryApplet};
@@ -921,7 +921,7 @@ struct Values {
     // Network
     Setting<std::string> network_interface{linkage, std::string(), "network_interface",
                                            Category::Network};
-    SwitchableSetting<bool> airplane_mode{linkage, true, "airplane_mode", Category::Network};
+    SwitchableSetting<bool> airplane_mode{linkage, false, "airplane_mode", Category::Network};
 
     // WebService
     Setting<std::string> web_api_url{linkage, "api.ynet-fun.xyz", "web_api_url",

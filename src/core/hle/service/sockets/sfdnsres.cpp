@@ -106,10 +106,20 @@ static bool IsBlockedHost(const std::string& host) {
 
 // Online Switch 2: the game's NPLN servers (*.npln.srv.nintendo.net) go to our own server
 // instead of being blocked. Address from NX2_ONLINE_SERVER, else this PC (127.0.0.1).
-static std::string RedirectOnlineHost(const std::string& host) {
-    static constexpr std::string_view npln_suffix = ".npln.srv.nintendo.net";
-    if (host.size() <= npln_suffix.size() ||
-        host.compare(host.size() - npln_suffix.size(), npln_suffix.size(), npln_suffix) != 0) {
+static std::string RedirectOnlineHost(const std::string& raw_host) {
+    // The game leaves a "%" where the console (nsd) writes its environment: "lp1" on retail.
+    std::string host = raw_host;
+    for (std::size_t at = host.find('%'); at != std::string::npos; at = host.find('%', at + 3)) {
+        host.replace(at, 1, "lp1");
+    }
+    const auto ends_with = [&host](std::string_view suffix) {
+        return host.size() > suffix.size() &&
+               host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    // NPLN servers, and the NAT-check servers Pia asks before it links players (nncs1 / nncs2).
+    const bool npln = ends_with(".npln.srv.nintendo.net");
+    const bool nncs = host.rfind("nncs", 0) == 0 && ends_with(".srv.nintendo.net");
+    if (!npln && !nncs) {
         return host;
     }
     const char* env = std::getenv("NX2_ONLINE_SERVER");
