@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -981,11 +982,16 @@ bool PopIcmpReply(SOCKET s, std::span<u8> message, sockaddr_in& from, s32& size)
     }
     IcmpReply reply = std::move(it->second.front());
     it->second.pop_front();
+    static const bool no_header = std::getenv("NX2_ICMP_NOHDR") != nullptr;
+    if (no_header && reply.data.size() > 20) {
+        reply.data.erase(reply.data.begin(), reply.data.begin() + 20);
+    }
     const size_t n = std::min(reply.data.size(), message.size());
     std::memcpy(message.data(), reply.data.data(), n);
     from = reply.from;
     size = static_cast<s32>(n);
-    LOG_INFO(Network, "[ONLINE] icmp reply given to the game: {} bytes", n);
+    LOG_INFO(Network, "[ONLINE] icmp reply given to the game: {} bytes (game buffer {} bytes, {})",
+             n, message.size(), no_header ? "without IP header" : "with IP header");
     return true;
 }
 } // namespace
