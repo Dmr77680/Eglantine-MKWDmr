@@ -1258,7 +1258,7 @@ std::pair<s32, Errno> Socket::RecvFrom(int flags, std::span<u8> message, SockAdd
             if (addr) {
                 *addr = TranslateToSockAddrIn(addr_in, addrlen);
                 static std::atomic<int> udp_recvs{0};
-                if (udp_recvs.fetch_add(1) < 150) {
+                if (udp_recvs.fetch_add(1) < 20000) {
                     std::string head;
                     for (int i = 0; i < result && i < 20; ++i) {
                         head += fmt::format("{:02x}", message[i]);
@@ -1435,7 +1435,7 @@ std::pair<s32, Errno> Socket::SendTo(u32 flags, std::span<const u8> message,
 
     if (addr && addr->portno != 0) {
         static std::atomic<int> udp_sends{0};
-        if (udp_sends.fetch_add(1) < 150) {
+        if (udp_sends.fetch_add(1) < 20000) {
             std::string head;
             for (std::size_t i = 0; i < message.size() && i < 20; ++i) {
                 head += fmt::format("{:02x}", message[i]);
