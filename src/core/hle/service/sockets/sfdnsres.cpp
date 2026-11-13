@@ -161,7 +161,8 @@ static std::string RedirectOnlineHost(const std::string& raw_host) {
     // NPLN servers, and the NAT-check servers Pia asks before it links players (nncs1 / nncs2).
     const bool npln = ends_with(".npln.srv.nintendo.net");
     const bool nncs = host.rfind("nncs", 0) == 0 && ends_with(".srv.nintendo.net");
-    if (!npln && !nncs) {
+    const bool pserver = host.rfind("g", 0) == 0 && ends_with(".p.srv.nintendo.net");
+    if (!npln && !nncs && !pserver) {
         return host;
     }
     const std::string target = OnlineServerAddress();

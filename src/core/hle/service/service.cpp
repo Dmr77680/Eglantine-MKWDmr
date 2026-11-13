@@ -9,6 +9,7 @@
 #include <tuple>
 #include <mutex>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <chrono>
@@ -20,8 +21,10 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/hle/ipc.h"
+#include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/service/ipc_helpers.h"
+#include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/service.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/sm/sm.h"
@@ -51,6 +54,41 @@ ServiceFrameworkBase::ServiceFrameworkBase(Core::System& system_, const char* se
 ServiceFrameworkBase::~ServiceFrameworkBase() {
     // Wait for other threads to release access before destroying
     const auto guard = ServiceFrameworkBase::LockService();
+    if (stub_event) {
+        stub_context->CloseEvent(stub_event);
+    }
+}
+
+namespace {
+// [ONLINE] Callers read the reply words they expect without checking how many were written, so
+// stub replies carry this many zeroed words.
+constexpr u32 StubZeroedWords = 32;
+
+void PushStubZeroes(IPC::ResponseBuilder& rb) {
+    for (u32 i = 0; i < StubZeroedWords; ++i) {
+        rb.Push<u32>(0);
+    }
+}
+} // namespace
+
+void ServiceFrameworkBase::StubReplyZeroed(HLERequestContext& ctx) {
+    LOG_DEBUG(Service, "(STUBBED) {}::{} (placeholder reply)", service_name, ctx.GetCommand());
+    IPC::ResponseBuilder rb{ctx, 2 + StubZeroedWords};
+    rb.Push(ResultSuccess);
+    PushStubZeroes(rb);
+}
+
+void ServiceFrameworkBase::StubReplyEvent(HLERequestContext& ctx) {
+    LOG_DEBUG(Service, "(STUBBED) {}::{} (placeholder reply, event)", service_name,
+              ctx.GetCommand());
+    if (!stub_event) {
+        stub_context = std::make_unique<KernelHelpers::ServiceContext>(system, service_name);
+        stub_event = stub_context->CreateEvent(fmt::format("{}:StubEvent", service_name));
+    }
+    IPC::ResponseBuilder rb{ctx, 2 + StubZeroedWords, 1, 0};
+    rb.Push(ResultSuccess);
+    PushStubZeroes(rb);
+    rb.PushCopyObjects(ctx, stub_event->GetReadableEvent());
 }
 
 void ServiceFrameworkBase::RegisterHandlersBase(const FunctionInfoBase* functions, std::size_t n) {

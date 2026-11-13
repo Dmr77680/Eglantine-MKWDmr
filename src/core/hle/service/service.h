@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <mutex>
 #include "common/container/unordered_map.h"
 #include "common/common_types.h"
@@ -20,11 +21,16 @@ class System;
 }
 
 namespace Kernel {
+class KEvent;
 class KServerSession;
 class ServiceThread;
 } // namespace Kernel
 
 namespace Service {
+
+namespace KernelHelpers {
+class ServiceContext;
+}
 
 namespace FileSystem {
 class FileSystemController;
@@ -77,7 +83,18 @@ protected:
     [[nodiscard]] virtual std::unique_lock<std::mutex> LockService() noexcept {
         return std::unique_lock{lock_service};
     }
+
+    /// [ONLINE] Placeholder handlers for commands whose reply shape is known but whose meaning is
+    /// not: StubReplyZeroed replies with zeroed data words, StubReplyEvent adds a copy handle to
+    /// an event that never fires.
+    void StubReplyZeroed(HLERequestContext& ctx);
+    void StubReplyEvent(HLERequestContext& ctx);
+
 private:
+    /// Event handed out by StubReplyEvent, created on first use.
+    Kernel::KEvent* stub_event{};
+    std::unique_ptr<KernelHelpers::ServiceContext> stub_context;
+
     template <typename T>
     friend class ServiceFramework;
 

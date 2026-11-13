@@ -5,8 +5,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <thread>
+#include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -15,14 +23,18 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <icmpapi.h>
 #else
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -43,6 +55,9 @@ enum class CallType {
     Send,
     Other,
 };
+
+/// Set while socket operations are cancelled, for waits that no host socket operation wakes.
+std::atomic_bool socket_operations_cancelled{false};
 
 #ifdef _WIN32
 
@@ -111,6 +126,11 @@ LINGER MakeLinger(bool enable, u32 linger_value) {
     value.l_onoff = enable ? 1 : 0;
     value.l_linger = static_cast<u_short>(linger_value);
     return value;
+}
+
+/// SO_RCVTIMEO and SO_SNDTIMEO take milliseconds on Windows.
+DWORD MakeTimeout(u32 timeout_ms) {
+    return timeout_ms;
 }
 
 bool EnableNonBlock(SOCKET fd, bool enable) {
@@ -247,6 +267,14 @@ linger MakeLinger(bool enable, u32 linger_value) {
     linger value;
     value.l_onoff = enable ? 1 : 0;
     value.l_linger = linger_value;
+    return value;
+}
+
+/// SO_RCVTIMEO and SO_SNDTIMEO take a timeval elsewhere.
+timeval MakeTimeout(u32 timeout_ms) {
+    timeval value{};
+    value.tv_sec = static_cast<decltype(value.tv_sec)>(timeout_ms / 1000);
+    value.tv_usec = static_cast<decltype(value.tv_usec)>((timeout_ms % 1000) * 1000);
     return value;
 }
 
@@ -649,6 +677,10 @@ short TranslatePollEvents(PollEvents events) {
     translate(PollEvents::WrBand, POLLWRBAND);
 
 #ifdef _WIN32
+    // WSAPoll rejects POLLPRI and reports out-of-band data as POLLRDBAND instead; Poll maps it back.
+    if ((result & POLLPRI) != 0) {
+        result = static_cast<short>((result & ~POLLPRI) | POLLRDBAND);
+    }
     short allowed_events = POLLRDBAND | POLLRDNORM | POLLWRNORM;
     // Unlike poll on other OSes, WSAPoll will complain if any other flags are set on input.
     if (result & ~allowed_events) {
@@ -699,11 +731,17 @@ NetworkInstance::~NetworkInstance() {
 }
 
 void CancelPendingSocketOperations() {
+    socket_operations_cancelled = true;
     InterruptSocketOperations();
 }
 
 void RestartSocketOperations() {
     AcknowledgeInterrupt();
+    socket_operations_cancelled = false;
+}
+
+bool SocketOperationsCancelled() {
+    return socket_operations_cancelled;
 }
 
 std::optional<IPv4Address> GetHostIPv4Address() {
@@ -720,6 +758,17 @@ std::optional<IPv4Address> GetHostIPv4Address() {
     }
 
     return TranslateIPv4(network_interface->ip_address);
+}
+
+std::optional<IPv4Address> GetRoomIPv4Address() {
+    if (const auto room_member = GetRoomMember().lock()) {
+        // The room host and moderators are in the Moderator state instead of Joined
+        const auto state = room_member->GetState();
+        if (state == RoomMember::State::Joined || state == RoomMember::State::Moderator) {
+            return room_member->GetFakeIpAddress();
+        }
+    }
+    return std::nullopt;
 }
 
 std::string IPv4AddressToString(IPv4Address ip_addr) {
@@ -791,6 +840,20 @@ std::pair<s32, Errno> Poll(std::vector<PollFD>& pollfds, s32 timeout) {
 
     for (size_t i = 0; i < num; ++i) {
         pollfds[i].revents = TranslatePollRevents(host_pollfds[i].revents);
+#ifdef _WIN32
+        // POLLIN is POLLRDNORM | POLLRDBAND on Windows, which the translation above takes as In
+        // alone; normal and out-of-band data stay reported as RdNorm and RdBand too.
+        if ((host_pollfds[i].revents & POLLRDNORM) != 0) {
+            pollfds[i].revents |= PollEvents::RdNorm;
+        }
+        if ((host_pollfds[i].revents & POLLRDBAND) != 0) {
+            pollfds[i].revents |= PollEvents::RdBand;
+            // Out-of-band data asked for as Pri comes back as POLLRDBAND.
+            if (True(pollfds[i].events & PollEvents::Pri)) {
+                pollfds[i].revents |= PollEvents::Pri;
+            }
+        }
+#endif
     }
 
     if (result > 0) {
@@ -815,29 +878,151 @@ Socket::Socket(Socket&& rhs) noexcept {
 }
 
 template <typename T>
-std::pair<T, Errno> Socket::GetSockOpt(SOCKET fd_so, int option) {
+std::pair<T, Errno> Socket::GetSockOpt(SOCKET fd_so, int level, int option) {
     T value{};
     socklen_t len = sizeof(value);
-    const int result = getsockopt(fd_so, SOL_SOCKET, option, reinterpret_cast<char*>(&value), &len);
+    const int result = getsockopt(fd_so, level, option, reinterpret_cast<char*>(&value), &len);
     if (result != SOCKET_ERROR) {
-        ASSERT(len == sizeof(value));
+        // Windows reports TCP_NODELAY in a single byte. The value starts zeroed, so a shorter
+        // option still reads correctly on the little-endian hosts we run on.
+        ASSERT(len > 0 && static_cast<size_t>(len) <= sizeof(value));
         return {value, Errno::SUCCESS};
     }
     return {value, GetAndLogLastError()};
 }
 
 template <typename T>
-Errno Socket::SetSockOpt(SOCKET fd_so, int option, T value) {
+Errno Socket::SetSockOpt(SOCKET fd_so, int level, int option, T value) {
     const int result =
-        setsockopt(fd_so, SOL_SOCKET, option, reinterpret_cast<const char*>(&value), sizeof(value));
+        setsockopt(fd_so, level, option, reinterpret_cast<const char*>(&value), sizeof(value));
     if (result != SOCKET_ERROR) {
         return Errno::SUCCESS;
     }
     return GetAndLogLastError();
 }
 
+#ifdef _WIN32
+namespace {
+struct IcmpReply {
+    std::vector<u8> data;
+    sockaddr_in from{};
+};
+std::mutex icmp_mutex;
+std::map<SOCKET, std::deque<IcmpReply>> icmp_replies;
+
+u16 InternetChecksum(const u8* d, size_t n) {
+    u32 sum = 0;
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        sum += (static_cast<u32>(d[i]) << 8) | d[i + 1];
+    }
+    if (n & 1) {
+        sum += static_cast<u32>(d[n - 1]) << 8;
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    return static_cast<u16>(~sum);
+}
+
+void StartIcmpEcho(SOCKET s, u32 dest_net_order, std::vector<u8> msg) {
+    std::thread([s, dest_net_order, msg = std::move(msg)] {
+        HANDLE h = IcmpCreateFile();
+        if (h == INVALID_HANDLE_VALUE) {
+            LOG_WARNING(Network, "[ONLINE] icmp echo: IcmpCreateFile failed {}", GetLastError());
+            return;
+        }
+        const DWORD plen = msg.size() > 8 ? static_cast<DWORD>(msg.size() - 8) : 0;
+        std::vector<u8> buf(sizeof(ICMP_ECHO_REPLY) + plen + 64);
+        const DWORD n = IcmpSendEcho(h, dest_net_order, plen ? const_cast<u8*>(msg.data() + 8) : nullptr,
+                                     static_cast<WORD>(plen), nullptr, buf.data(),
+                                     static_cast<DWORD>(buf.size()), 1500);
+        u8 ttl = 64;
+        if (n > 0) {
+            ttl = reinterpret_cast<ICMP_ECHO_REPLY*>(buf.data())->Options.Ttl;
+        }
+        IcmpCloseHandle(h);
+        LOG_INFO(Network, "[ONLINE] icmp echo seq={} -> {}", (msg.size() >= 8 ? (msg[6] << 8 | msg[7]) : 0),
+                 n > 0 ? "reply" : "no reply");
+        if (n == 0) {
+            return;
+        }
+        std::vector<u8> pkt(20 + msg.size());
+        pkt[0] = 0x45;
+        pkt[2] = static_cast<u8>(pkt.size() >> 8);
+        pkt[3] = static_cast<u8>(pkt.size());
+        pkt[8] = ttl;
+        pkt[9] = 1;
+        std::memcpy(&pkt[12], &dest_net_order, 4);
+        std::memcpy(&pkt[20], msg.data(), msg.size());
+        pkt[20] = 0; // echo reply
+        pkt[22] = pkt[23] = 0;
+        const u16 ic = InternetChecksum(&pkt[20], msg.size());
+        pkt[22] = static_cast<u8>(ic >> 8);
+        pkt[23] = static_cast<u8>(ic);
+        const u16 hc = InternetChecksum(pkt.data(), 20);
+        pkt[10] = static_cast<u8>(hc >> 8);
+        pkt[11] = static_cast<u8>(hc);
+        IcmpReply reply;
+        reply.data = std::move(pkt);
+        reply.from.sin_family = AF_INET;
+        reply.from.sin_addr.s_addr = dest_net_order;
+        std::lock_guard lock{icmp_mutex};
+        const auto it = icmp_replies.find(s);
+        if (it != icmp_replies.end()) {
+            it->second.push_back(std::move(reply));
+        }
+    }).detach();
+}
+
+bool PopIcmpReply(SOCKET s, std::span<u8> message, sockaddr_in& from, s32& size) {
+    std::lock_guard lock{icmp_mutex};
+    const auto it = icmp_replies.find(s);
+    if (it == icmp_replies.end() || it->second.empty()) {
+        return false;
+    }
+    IcmpReply reply = std::move(it->second.front());
+    it->second.pop_front();
+    static const bool no_header = std::getenv("NX2_ICMP_NOHDR") != nullptr;
+    if (no_header && reply.data.size() > 20) {
+        reply.data.erase(reply.data.begin(), reply.data.begin() + 20);
+    }
+    const size_t n = std::min(reply.data.size(), message.size());
+    std::memcpy(message.data(), reply.data.data(), n);
+    from = reply.from;
+    size = static_cast<s32>(n);
+    LOG_INFO(Network, "[ONLINE] icmp reply given to the game: {} bytes (game buffer {} bytes, {})",
+             n, message.size(), no_header ? "without IP header" : "with IP header");
+    return true;
+}
+} // namespace
+#endif
+
+#ifdef _WIN32
+// [ONLINE] Windows only delivers data to a raw socket once it is bound; a console does not need it.
+static void BindRawSocketOnce(SOCKET raw_fd) {
+    static std::mutex bound_mutex;
+    static std::set<SOCKET> bound;
+    std::lock_guard lock{bound_mutex};
+    if (!bound.insert(raw_fd).second) {
+        return;
+    }
+    sockaddr_in any{};
+    any.sin_family = AF_INET;
+    any.sin_addr.s_addr = htonl(INADDR_ANY);
+    any.sin_port = 0;
+    if (bind(raw_fd, reinterpret_cast<const sockaddr*>(&any), sizeof(any)) == 0) {
+        LOG_INFO(Network, "[ONLINE] raw socket bound (0.0.0.0)");
+    } else {
+        LOG_WARNING(Network, "[ONLINE] raw socket bind failed: {}", WSAGetLastError());
+    }
+}
+#endif
+
 Errno Socket::Initialize(Domain domain, Type type, Protocol protocol) {
     fd = socket(TranslateDomainToNative(domain), TranslateTypeToNative(type), TranslateProtocolToNative(protocol));
+    LOG_INFO(Network, "[ONLINE] new host socket: domain={} type={} protocol={} ({})",
+             static_cast<u32>(domain), static_cast<u32>(type), static_cast<u32>(protocol),
+             fd != INVALID_SOCKET ? "ok" : "failed");
     if (fd != INVALID_SOCKET) {
         return Errno::SUCCESS;
     }
@@ -884,6 +1069,13 @@ std::pair<SocketBase::AcceptResult, Errno> Socket::Accept() {
 }
 
 Errno Socket::Connect(SockAddrIn addr_in) {
+    {
+        static std::atomic<int> connects{0};
+        if (connects.fetch_add(1) < 60) {
+            LOG_INFO(Network, "[ONLINE] connect to {}.{}.{}.{}:{}", addr_in.ip[0], addr_in.ip[1],
+                     addr_in.ip[2], addr_in.ip[3], addr_in.portno);
+        }
+    }
     const sockaddr host_addr_in = TranslateFromSockAddrIn(addr_in);
     if (connect(fd, &host_addr_in, sizeof(host_addr_in)) != SOCKET_ERROR) {
         return Errno::SUCCESS;
@@ -952,60 +1144,249 @@ Errno Socket::Shutdown(ShutdownHow how) {
     return GetAndLogLastError();
 }
 
+template <typename Operation>
+std::pair<s32, Errno> Socket::Transfer(int flags, Operation operation) {
+#ifdef _WIN32
+    if ((flags & FLAG_MSG_DONTWAIT) != 0) {
+        if (const Errno begin_errno = BeginDontWait(); begin_errno != Errno::SUCCESS) {
+            return {-1, begin_errno};
+        }
+        const std::pair<s32, Errno> result = operation(0);
+        EndDontWait();
+        return result;
+    }
+    while (true) {
+        const u64 epoch = dont_wait_epoch;
+        const std::pair<s32, Errno> result = operation(0);
+        if (result.second != Errno::AGAIN || is_non_blocking || !WaitOutDontWait(epoch)) {
+            return result;
+        }
+    }
+#else
+    return operation((flags & FLAG_MSG_DONTWAIT) != 0 ? MSG_DONTWAIT : 0);
+#endif
+}
+
+#ifdef _WIN32
+Errno Socket::BeginDontWait() {
+    std::scoped_lock lock{mode_mutex};
+    if (dont_wait_calls == 0 && !is_non_blocking) {
+        if (!EnableNonBlock(fd, true)) {
+            return GetAndLogLastError();
+        }
+        ++dont_wait_epoch;
+    }
+    ++dont_wait_calls;
+    return Errno::SUCCESS;
+}
+
+void Socket::EndDontWait() {
+    std::scoped_lock lock{mode_mutex};
+    if (--dont_wait_calls != 0 || is_non_blocking) {
+        return;
+    }
+    if (!EnableNonBlock(fd, false)) {
+        // Blocking calls then fail with EAGAIN as their own, rather than wait for a change.
+        GetAndLogLastError();
+    }
+    ++dont_wait_epoch;
+    dont_wait_ended.notify_all();
+}
+
+bool Socket::WaitOutDontWait(u64 epoch) {
+    std::unique_lock lock{mode_mutex};
+    // Unless calls given FLAG_MSG_DONTWAIT made the host socket nonblocking while the call ran,
+    // its EAGAIN is its own, as it is once the socket is nonblocking.
+    if (is_non_blocking || (epoch % 2 == 0 && dont_wait_epoch == epoch)) {
+        return false;
+    }
+    dont_wait_ended.wait(lock, [this] { return dont_wait_epoch % 2 == 0 || is_non_blocking; });
+    return !is_non_blocking;
+}
+#endif
+
 std::pair<s32, Errno> Socket::Recv(int flags, std::span<u8> message) {
-    ASSERT(flags == 0);
+    ASSERT((flags & ~FLAG_MSG_DONTWAIT) == 0);
     ASSERT(message.size() < static_cast<size_t>((std::numeric_limits<int>::max)()));
 
-    const auto result =
-        recv(fd, reinterpret_cast<char*>(message.data()), static_cast<int>(message.size()), 0);
-    if (result != SOCKET_ERROR) {
-        return {static_cast<s32>(result), Errno::SUCCESS};
-    }
+    return Transfer(flags, [&](int host_flags) -> std::pair<s32, Errno> {
+#ifdef _WIN32
+        {
+            sockaddr_in from{};
+            s32 got = 0;
+            if (PopIcmpReply(fd, message, from, got)) {
+                return {got, Errno::SUCCESS};
+            }
+        }
+#endif
+        const auto result = recv(fd, reinterpret_cast<char*>(message.data()),
+                                 static_cast<int>(message.size()), host_flags);
+        if (result != SOCKET_ERROR) {
+            return {static_cast<s32>(result), Errno::SUCCESS};
+        }
 
-    return {-1, GetAndLogLastError()};
+        return {-1, GetAndLogLastError()};
+    });
 }
 
 std::pair<s32, Errno> Socket::RecvFrom(int flags, std::span<u8> message, SockAddrIn* addr) {
-    ASSERT(flags == 0);
+    ASSERT((flags & ~FLAG_MSG_DONTWAIT) == 0);
     ASSERT(message.size() < static_cast<size_t>((std::numeric_limits<int>::max)()));
 
-    sockaddr_in addr_in{};
-    socklen_t addrlen = sizeof(addr_in);
-    socklen_t* const p_addrlen = addr ? &addrlen : nullptr;
-    sockaddr* const p_addr_in = addr ? reinterpret_cast<sockaddr*>(&addr_in) : nullptr;
+    return Transfer(flags, [&](int host_flags) -> std::pair<s32, Errno> {
+        sockaddr_in addr_in{};
+        socklen_t addrlen = sizeof(addr_in);
+        socklen_t* const p_addrlen = addr ? &addrlen : nullptr;
+        sockaddr* const p_addr_in = addr ? reinterpret_cast<sockaddr*>(&addr_in) : nullptr;
 
-    const auto result = recvfrom(fd, reinterpret_cast<char*>(message.data()),
-                                 static_cast<int>(message.size()), 0, p_addr_in, p_addrlen);
-    if (result != SOCKET_ERROR) {
+#ifdef _WIN32
+        {
+            sockaddr_in from{};
+            s32 got = 0;
+            if (PopIcmpReply(fd, message, from, got)) {
+                if (addr) {
+                    *addr = TranslateToSockAddrIn(from, sizeof(from));
+                }
+                return {got, Errno::SUCCESS};
+            }
+        }
+#endif
+        const auto result =
+            recvfrom(fd, reinterpret_cast<char*>(message.data()),
+                     static_cast<int>(message.size()), host_flags, p_addr_in, p_addrlen);
+        if (result != SOCKET_ERROR) {
+            if (addr) {
+                *addr = TranslateToSockAddrIn(addr_in, addrlen);
+                static std::atomic<int> udp_recvs{0};
+                if (udp_recvs.fetch_add(1) < 20000) {
+                    std::string head;
+                    for (int i = 0; i < result && i < 20; ++i) {
+                        head += fmt::format("{:02x}", message[i]);
+                    }
+                    LOG_INFO(Network, "[ONLINE] udp recv: {} bytes from {}.{}.{}.{}:{} data={}",
+                             result, addr->ip[0], addr->ip[1], addr->ip[2], addr->ip[3],
+                             addr->portno, head);
+                }
+            }
+            return {static_cast<s32>(result), Errno::SUCCESS};
+        }
+
+#ifdef _WIN32
+        // [ONLINE] Windows will not receive on a raw socket that was never bound; a console does.
+        if (WSAGetLastError() == WSAEINVAL) {
+            int sock_type = 0;
+            int sock_type_len = sizeof(sock_type);
+            if (getsockopt(fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&sock_type),
+                           &sock_type_len) == 0 &&
+                sock_type == SOCK_RAW) {
+                BindRawSocketOnce(fd);
+                const auto retry =
+                    recvfrom(fd, reinterpret_cast<char*>(message.data()),
+                             static_cast<int>(message.size()), host_flags, p_addr_in, p_addrlen);
+                if (retry != SOCKET_ERROR) {
+                    if (addr) {
+                        *addr = TranslateToSockAddrIn(addr_in, addrlen);
+                    }
+                    static std::atomic<int> raw_ok{0};
+                    if (raw_ok.fetch_add(1) < 10) {
+                        std::string head;
+                        for (int i = 0; i < retry && i < 32; ++i) {
+                            head += fmt::format("{:02x}", message[i]);
+                        }
+                        LOG_INFO(Network, "[ONLINE] raw receive: {} bytes data={}", retry, head);
+                    }
+                    return {static_cast<s32>(retry), Errno::SUCCESS};
+                }
+                if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                    return {-1, Errno::AGAIN};
+                }
+                static std::atomic<int> raw_receives{0};
+                if (raw_receives.fetch_add(1) < 3) {
+                    LOG_INFO(Network, "[ONLINE] raw receive: no data yet (error {})",
+                             WSAGetLastError());
+                }
+                return {-1, Errno::AGAIN};
+            }
+        }
+#endif
+        return {-1, GetAndLogLastError()};
+    });
+}
+
+std::pair<s32, Errno> Socket::RecvMsg(int flags, std::span<u8> message, SockAddrIn* addr,
+                                      u32& msg_flags) {
+    ASSERT((flags & ~(FLAG_MSG_PEEK | FLAG_MSG_DONTWAIT)) == 0);
+    ASSERT(message.size() < static_cast<size_t>((std::numeric_limits<int>::max)()));
+
+    msg_flags = 0;
+    const int peek_flags = (flags & FLAG_MSG_PEEK) != 0 ? MSG_PEEK : 0;
+    return Transfer(flags, [&](int host_flags) -> std::pair<s32, Errno> {
+        const int native_flags = peek_flags | host_flags;
+        sockaddr_in addr_in{};
+#ifdef _WIN32
+        // A datagram that does not fit fills message with its start and fails with WSAEMSGSIZE,
+        // which recvmsg reports as a successful receive with MSG_TRUNC.
+        socklen_t addrlen = sizeof(addr_in);
+        const auto result =
+            recvfrom(fd, reinterpret_cast<char*>(message.data()), static_cast<int>(message.size()),
+                     native_flags, addr ? reinterpret_cast<sockaddr*>(&addr_in) : nullptr,
+                     addr ? &addrlen : nullptr);
+        s32 received = static_cast<s32>(result);
+        if (result == SOCKET_ERROR) {
+            if (WSAGetLastError() != WSAEMSGSIZE) {
+                return {-1, GetAndLogLastError()};
+            }
+            received = static_cast<s32>(message.size());
+            msg_flags |= FLAG_MSG_TRUNC;
+        }
+#else
+        iovec iov{};
+        iov.iov_base = message.data();
+        iov.iov_len = message.size();
+        msghdr header{};
+        header.msg_name = addr ? &addr_in : nullptr;
+        header.msg_namelen = addr ? static_cast<socklen_t>(sizeof(addr_in)) : 0;
+        header.msg_iov = &iov;
+        header.msg_iovlen = 1;
+        const auto result = recvmsg(fd, &header, native_flags);
+        if (result == SOCKET_ERROR) {
+            return {-1, GetAndLogLastError()};
+        }
+        const socklen_t addrlen = header.msg_namelen;
+        const s32 received = static_cast<s32>(result);
+        if ((header.msg_flags & MSG_TRUNC) != 0) {
+            msg_flags |= FLAG_MSG_TRUNC;
+        }
+#endif
         if (addr) {
             *addr = TranslateToSockAddrIn(addr_in, addrlen);
         }
-        return {static_cast<s32>(result), Errno::SUCCESS};
-    }
-
-    return {-1, GetAndLogLastError()};
+        return {received, Errno::SUCCESS};
+    });
 }
 
 std::pair<s32, Errno> Socket::Send(std::span<const u8> message, int flags) {
     ASSERT(message.size() < static_cast<size_t>((std::numeric_limits<int>::max)()));
-    ASSERT(flags == 0);
+    ASSERT((flags & ~FLAG_MSG_DONTWAIT) == 0);
 
     int native_flags = 0;
 #ifdef __unix__
     native_flags |= MSG_NOSIGNAL; // do not send us SIGPIPE
 #endif
-    const auto result = send(fd, reinterpret_cast<const char*>(message.data()),
-                             static_cast<int>(message.size()), native_flags);
-    if (result != SOCKET_ERROR) {
-        return {static_cast<s32>(result), Errno::SUCCESS};
-    }
+    return Transfer(flags, [&](int host_flags) -> std::pair<s32, Errno> {
+        const auto result = send(fd, reinterpret_cast<const char*>(message.data()),
+                                 static_cast<int>(message.size()), native_flags | host_flags);
+        if (result != SOCKET_ERROR) {
+            return {static_cast<s32>(result), Errno::SUCCESS};
+        }
 
-    return {-1, GetAndLogLastError(CallType::Send)};
+        return {-1, GetAndLogLastError(CallType::Send)};
+    });
 }
 
 std::pair<s32, Errno> Socket::SendTo(u32 flags, std::span<const u8> message,
                                      const SockAddrIn* addr) {
-    ASSERT(flags == 0);
+    ASSERT((flags & ~FLAG_MSG_DONTWAIT) == 0);
 
     const sockaddr* to = nullptr;
     const int to_len = addr ? sizeof(sockaddr) : 0;
@@ -1016,16 +1397,73 @@ std::pair<s32, Errno> Socket::SendTo(u32 flags, std::span<const u8> message,
         to = &host_addr_in;
     }
 
-    const auto result = sendto(fd, reinterpret_cast<const char*>(message.data()),
-                               static_cast<int>(message.size()), 0, to, to_len);
-    if (result != SOCKET_ERROR) {
-        return {static_cast<s32>(result), Errno::SUCCESS};
+    {
+        int sock_type = 0;
+        socklen_t sock_type_len = sizeof(sock_type);
+        if (getsockopt(fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&sock_type),
+                       &sock_type_len) == 0 &&
+            sock_type == SOCK_RAW) {
+#ifdef _WIN32
+            BindRawSocketOnce(fd);
+            if (addr && !message.empty() && message[0] == 8) {
+                {
+                    std::lock_guard lock{icmp_mutex};
+                    icmp_replies.try_emplace(fd);
+                }
+                u32 dest;
+                std::memcpy(&dest, addr->ip.data(), 4);
+                StartIcmpEcho(fd, dest, std::vector<u8>(message.begin(), message.end()));
+            }
+#endif
+            static std::atomic<int> raw_sends{0};
+            if (raw_sends.fetch_add(1) < 20) {
+                std::string head;
+                for (std::size_t i = 0; i < message.size() && i < 24; ++i) {
+                    head += fmt::format("{:02x}", message[i]);
+                }
+                if (addr) {
+                    LOG_INFO(Network, "[ONLINE] raw send: {} bytes to {}.{}.{}.{}:{} data={}",
+                             message.size(), addr->ip[0], addr->ip[1], addr->ip[2], addr->ip[3],
+                             addr->portno, head);
+                } else {
+                    LOG_INFO(Network, "[ONLINE] raw send: {} bytes (no address) data={}",
+                             message.size(), head);
+                }
+            }
+        }
     }
 
-    return {-1, GetAndLogLastError(CallType::Send)};
+    if (addr && addr->portno != 0) {
+        static std::atomic<int> udp_sends{0};
+        if (udp_sends.fetch_add(1) < 20000) {
+            std::string head;
+            for (std::size_t i = 0; i < message.size() && i < 20; ++i) {
+                head += fmt::format("{:02x}", message[i]);
+            }
+            LOG_INFO(Network, "[ONLINE] udp send: {} bytes to {}.{}.{}.{}:{} data={}",
+                     message.size(), addr->ip[0], addr->ip[1], addr->ip[2], addr->ip[3],
+                     addr->portno, head);
+        }
+    }
+
+    return Transfer(static_cast<int>(flags), [&](int host_flags) -> std::pair<s32, Errno> {
+        const auto result = sendto(fd, reinterpret_cast<const char*>(message.data()),
+                                   static_cast<int>(message.size()), host_flags, to, to_len);
+        if (result != SOCKET_ERROR) {
+            return {static_cast<s32>(result), Errno::SUCCESS};
+        }
+
+        return {-1, GetAndLogLastError(CallType::Send)};
+    });
 }
 
 Errno Socket::Close() {
+#ifdef _WIN32
+    {
+        std::lock_guard lock{icmp_mutex};
+        icmp_replies.erase(fd);
+    }
+#endif
     [[maybe_unused]] const int result = closesocket(fd);
     if (result != 0) {
         LOG_WARNING(Network, "closesocket failed, socket may already be closed");
@@ -1036,43 +1474,70 @@ Errno Socket::Close() {
 }
 
 std::pair<Errno, Errno> Socket::GetPendingError() {
-    auto [pending_err, getsockopt_err] = GetSockOpt<int>(fd, SO_ERROR);
+    auto [pending_err, getsockopt_err] = GetSockOpt<int>(fd, SOL_SOCKET, SO_ERROR);
     return {TranslateNativeError(pending_err), getsockopt_err};
 }
 
+std::pair<bool, Errno> Socket::GetReuseAddr() {
+    const auto [value, getsockopt_err] = GetSockOpt<u32>(fd, SOL_SOCKET, SO_REUSEADDR);
+    return {value != 0, getsockopt_err};
+}
+
+std::pair<bool, Errno> Socket::GetNoDelay() {
+    const auto [value, getsockopt_err] = GetSockOpt<u32>(fd, IPPROTO_TCP, TCP_NODELAY);
+    return {value != 0, getsockopt_err};
+}
+
 Errno Socket::SetLinger(bool enable, u32 linger) {
-    return SetSockOpt(fd, SO_LINGER, MakeLinger(enable, linger));
+    return SetSockOpt(fd, SOL_SOCKET, SO_LINGER, MakeLinger(enable, linger));
 }
 
 Errno Socket::SetReuseAddr(bool enable) {
-    return SetSockOpt<u32>(fd, SO_REUSEADDR, enable ? 1 : 0);
+    return SetSockOpt<u32>(fd, SOL_SOCKET, SO_REUSEADDR, enable ? 1 : 0);
 }
 
 Errno Socket::SetKeepAlive(bool enable) {
-    return SetSockOpt<u32>(fd, SO_KEEPALIVE, enable ? 1 : 0);
+    return SetSockOpt<u32>(fd, SOL_SOCKET, SO_KEEPALIVE, enable ? 1 : 0);
 }
 
 Errno Socket::SetBroadcast(bool enable) {
-    return SetSockOpt<u32>(fd, SO_BROADCAST, enable ? 1 : 0);
+    return SetSockOpt<u32>(fd, SOL_SOCKET, SO_BROADCAST, enable ? 1 : 0);
 }
 
 Errno Socket::SetSndBuf(u32 value) {
-    return SetSockOpt(fd, SO_SNDBUF, value);
+    return SetSockOpt(fd, SOL_SOCKET, SO_SNDBUF, value);
 }
 
 Errno Socket::SetRcvBuf(u32 value) {
-    return SetSockOpt(fd, SO_RCVBUF, value);
+    return SetSockOpt(fd, SOL_SOCKET, SO_RCVBUF, value);
 }
 
 Errno Socket::SetSndTimeo(u32 value) {
-    return SetSockOpt(fd, SO_SNDTIMEO, value);
+    return SetSockOpt(fd, SOL_SOCKET, SO_SNDTIMEO, MakeTimeout(value));
 }
 
 Errno Socket::SetRcvTimeo(u32 value) {
-    return SetSockOpt(fd, SO_RCVTIMEO, value);
+    return SetSockOpt(fd, SOL_SOCKET, SO_RCVTIMEO, MakeTimeout(value));
+}
+
+Errno Socket::SetNoDelay(bool enable) {
+    return SetSockOpt<u32>(fd, IPPROTO_TCP, TCP_NODELAY, enable ? 1 : 0);
 }
 
 Errno Socket::SetNonBlock(bool enable) {
+#ifdef _WIN32
+    std::scoped_lock lock{mode_mutex};
+    if (dont_wait_calls > 0) {
+        // The host socket stays nonblocking for the calls given FLAG_MSG_DONTWAIT, and the last
+        // of them leaves it in this mode. Whether it is nonblocking for them alone changes.
+        if (enable != is_non_blocking) {
+            is_non_blocking = enable;
+            ++dont_wait_epoch;
+            dont_wait_ended.notify_all();
+        }
+        return Errno::SUCCESS;
+    }
+#endif
     if (EnableNonBlock(fd, enable)) {
         is_non_blocking = enable;
         return Errno::SUCCESS;
@@ -1084,8 +1549,16 @@ bool Socket::IsOpened() const {
     return fd != INVALID_SOCKET;
 }
 
+bool Socket::AcceptsProxyPacket(const ProxyPacket& packet) {
+    return false;
+}
+
 void Socket::HandleProxyPacket(const ProxyPacket& packet) {
     LOG_WARNING(Network, "ProxyPacket received, but not in Proxy mode!");
+}
+
+std::optional<PollEvents> Socket::EmulatedPoll(PollEvents events) {
+    return std::nullopt;
 }
 
 } // namespace Network
