@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - perf
+      - perf-online
   workflow_dispatch:
 
 permissions:
