@@ -3,6 +3,10 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <string>
+#include <string_view>
+#include <fmt/format.h>
 #include <algorithm>
 #include <array>
 
@@ -33,6 +37,51 @@
 #include "core/loader/loader.h"
 
 namespace Service::Account {
+
+namespace {
+std::string Base64UrlEncode(std::string_view in) {
+    static constexpr char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    std::size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        const u32 v = (u32{static_cast<u8>(in[i])} << 16) |
+                      (u32{static_cast<u8>(in[i + 1])} << 8) | u32{static_cast<u8>(in[i + 2])};
+        out += table[(v >> 18) & 63];
+        out += table[(v >> 12) & 63];
+        out += table[(v >> 6) & 63];
+        out += table[v & 63];
+    }
+    if (i + 1 == in.size()) {
+        const u32 v = u32{static_cast<u8>(in[i])} << 16;
+        out += table[(v >> 18) & 63];
+        out += table[(v >> 12) & 63];
+    } else if (i + 2 == in.size()) {
+        const u32 v = (u32{static_cast<u8>(in[i])} << 16) | (u32{static_cast<u8>(in[i + 1])} << 8);
+        out += table[(v >> 18) & 63];
+        out += table[(v >> 12) & 63];
+        out += table[(v >> 6) & 63];
+    }
+    return out;
+}
+
+/// A well-formed BAAS-style id token (a JWT) for the online service. It cannot be signed the way
+/// Nintendo signs it: games only read it, and our own server is the one that checks it.
+std::string MakeOnlineIdToken(u64 account_id) {
+    const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    const std::string header = R"({"typ":"JWT","alg":"RS256"})";
+    const std::string payload = fmt::format(
+        R"({{"sub":"{:016x}","iss":"https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com","aud":"ed9e2f05d286f7b8","iat":{},"exp":{},"bs:did":"{:016x}","jti":"{:016x}{:016x}","typ":"id_token"}})",
+        account_id, now, now + 3 * 60 * 60, account_id ^ 0x5A5A5A5A5A5A5A5AULL, account_id,
+        static_cast<u64>(now));
+    const std::string signature(256, '\x5a');
+    return Base64UrlEncode(header) + "." + Base64UrlEncode(payload) + "." +
+           Base64UrlEncode(signature);
+}
+} // namespace
 
 // Thumbnails are hard coded to be at least this size
 constexpr std::size_t THUMBNAIL_SIZE = 0x24000;
@@ -835,16 +884,21 @@ private:
         if (ReplyNextendoIdToken(system, ctx)) {
             return;
         }
-        LOG_WARNING(Service_ACC, "(STUBBED) called");
-
-        std::vector<u8> token_data(0x100);
-        std::fill(token_data.begin(), token_data.end(), u8(0));
-
+        const std::string token = MakeOnlineIdToken(profile_manager->GetLastOpenedUser().Hash());
+        const std::size_t capacity = ctx.GetWriteBufferSize();
+        std::vector<u8> token_data(token.begin(), token.end());
+        token_data.push_back(0);
+        if (capacity != 0 && token_data.size() > capacity) {
+            token_data.resize(capacity);
+        }
         ctx.WriteBuffer(token_data);
+
+        LOG_INFO(Service_ACC, "[ONLINE] LoadIdTokenCache: {} byte token (buffer {})", token.size(),
+                 capacity);
 
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
-        rb.Push(static_cast<u32>(token_data.size()));
+        rb.Push(static_cast<u32>(token.size()));
     }
 
     void GetNintendoAccountUserResourceCacheForApplication(HLERequestContext& ctx) {

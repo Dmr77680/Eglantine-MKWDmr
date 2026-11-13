@@ -1,0 +1,132 @@
+name: build-online
+
+# Lichii nx2 + our own online service (branch online-lichii). Same compiler and flags as Lichii's
+# own Windows job (clang-cl, NOMINMAX), without the tests.
+on:
+  push:
+    branches:
+      - online-lichii
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-online-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x86_64 (clang-cl) - online
+    runs-on: windows-2022
+    timeout-minutes: 240
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 1G
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install LLVM
+        shell: pwsh
+        run: ./tools/windows/install-llvm.ps1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install ccache
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'ccache.zip'
+          Invoke-WebRequest -OutFile $zip https://github.com/ccache/ccache/releases/download/v4.14.2/ccache-4.14.2-windows-x86_64.zip
+          if ((Get-FileHash -Algorithm SHA256 $zip).Hash -ne '6993ce645e53192cec592ee23186200b574ac4c59097ecde8d9cfd681b47ae84') {
+              throw 'ccache checksum mismatch'
+          }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          Join-Path $env:RUNNER_TEMP 'ccache-4.14.2-windows-x86_64' | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Restore dependencies and compiler objects
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: online-clang-cl-ccache-qt683-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            online-clang-cl-ccache-qt683-${{ runner.os }}-
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe"
+          "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe"
+          "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe"
+          "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe"
+          "-DCMAKE_C_FLAGS=-DWIN32 -D_WINDOWS -DNOMINMAX"
+          "-DCMAKE_CXX_FLAGS=-DWIN32 -D_WINDOWS -EHsc -DNOMINMAX"
+          -DENABLE_WERROR=OFF
+          -DBUILD_TESTING=OFF
+          -DLICHII_TESTS=OFF
+          -DENABLE_QT=ON
+          -DENABLE_QT_TRANSLATION=ON
+          -DLICHII_CMD=ON
+          -DLICHII_ROOM=OFF
+          -DLICHII_ROOM_STANDALONE=OFF
+          -DLICHII_USE_BUNDLED_QT=OFF
+          -DLICHII_USE_BUNDLED_SDL3=ON
+          -DENABLE_UPDATE_CHECKER=OFF
+          -DUSE_DISCORD_PRESENCE=OFF
+          -DUSE_CCACHE=ON
+
+      - name: Build
+        env:
+          CCACHE_COMPILERCHECK: string:${{ hashFiles('tools/windows/install-llvm.ps1') }}
+        run: |
+          ccache --zero-stats
+          cmake --build build --parallel
+          ccache --show-stats
+
+      - name: Package
+        shell: pwsh
+        run: |
+          if (-not (Test-Path build/bin/lichii.exe)) {
+            throw 'build/bin/lichii.exe was not produced'
+          }
+          windeployqt --release --no-translations build/bin/lichii.exe
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichii-online-${{ github.sha }}
+          path: build/bin/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Save dependencies and compiler objects
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: online-clang-cl-ccache-qt683-${{ runner.os }}-${{ github.sha }}

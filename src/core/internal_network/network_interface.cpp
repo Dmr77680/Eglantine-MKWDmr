@@ -277,8 +277,18 @@ std::vector<Network::NetworkInterface> GetAvailableNetworkInterfaces() {
 std::optional<Network::NetworkInterface> GetSelectedNetworkInterface() {
     auto const& sel_if = Settings::values.network_interface.GetValue();
     if (auto const ifaces = Network::GetAvailableNetworkInterfaces(); ifaces.size() > 0) {
-        if (sel_if.empty())
+        // [ONLINE] Automatic choice: a card that has a gateway (the one that reaches the
+        // Internet) rather than whichever comes first (often a virtual card).
+        const auto automatic = [&ifaces]() {
+            for (const auto& iface : ifaces) {
+                if (iface.gateway.s_addr != 0) {
+                    return iface;
+                }
+            }
             return ifaces[0];
+        };
+        if (sel_if.empty())
+            return automatic();
         if (auto const res = std::ranges::find_if(ifaces, [&sel_if](const auto& iface) {
             return iface.name == sel_if;
         }); res != ifaces.end())
@@ -286,10 +296,11 @@ std::optional<Network::NetworkInterface> GetSelectedNetworkInterface() {
         // Only print the error once to avoid log spam
         static bool print_error = true;
         if (print_error) {
-            LOG_WARNING(Network, "Couldn't find interface \"{}\"", sel_if);
+            LOG_WARNING(Network, "Couldn't find interface \"{}\", picking one automatically",
+                        sel_if);
             print_error = false;
         }
-        return std::nullopt;
+        return automatic();
     }
     LOG_WARNING(Network, "No interfaces");
     return std::nullopt;

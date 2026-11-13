@@ -124,6 +124,17 @@ extern std::atomic<u64> g_nx2_present_count;
 /// tool and bug reports.
 extern std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns;
 
+/// [ONLINE] Set (steady clock, ns) when a game looks up its NPLN server: from then on the kernel
+/// notes what each guest thread last waited on and dumps every thread 15 s and 40 s later.
+extern std::atomic<s64> g_online_dump_armed_ns;
+/// [ONLINE] How many of those two dumps have been written.
+extern std::atomic<int> g_online_dumps_done;
+void OnlineArmThreadDump();
+bool OnlineWatchActive();
+/// [ONLINE] Remember the last wait (ipc = false) or the last service call (ipc = true) of a thread.
+void OnlineNote(bool ipc, u64 thread_id, std::string text);
+std::string OnlineGetNote(bool ipc, u64 thread_id);
+
 class CpuManager;
 class Debugger;
 class DeviceMemory;

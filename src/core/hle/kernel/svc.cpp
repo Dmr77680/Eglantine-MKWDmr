@@ -9,7 +9,14 @@
 #include <cstring>
 #include <type_traits>
 
+#include <chrono>
+#include <string>
+#include <vector>
+
 #include "core/arm/arm_interface.h"
+#include "core/arm/debug.h"
+#include "core/hle/kernel/k_light_lock.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
@@ -2499,12 +2506,142 @@ static void Call64(Core::System& system, u32 imm, std::span<uint64_t, 8> args) {
     default: UNREACHABLE_MSG("Unhandled SVC {:#x}!", imm);
     }
 }
+// [ONLINE] The handles a WaitSynchronization/ReplyAndReceive waits on, with the event names.
+static std::string OnlineHandleList(KernelCore& kernel, KProcess& process, u64 address, s32 count) {
+    std::string list;
+    for (s32 i = 0; i < std::min(count, 8); ++i) {
+        const u32 handle = process.GetMemory().Read32(address + 4 * i);
+        KScopedAutoObject object = process.GetHandleTable().GetObject<KAutoObject>(kernel, handle);
+        std::string name = "?";
+        if (object.IsNotNull()) {
+            if (auto* event = object->DynamicCast<KReadableEvent*>(); event != nullptr) {
+                name = "event " + Service::KernelHelpers::DebugEventName(event);
+            } else if (auto* thread = object->DynamicCast<KThread*>(); thread != nullptr) {
+                name = fmt::format("thread t{}", thread->GetThreadId());
+            } else {
+                name = object->GetTypeName();
+            }
+        }
+        list += fmt::format(" {:#x}={}", handle, name);
+    }
+    return list;
+}
+
+// [ONLINE] Every thread of the game: name, state, last wait, last service call, call stack.
+static void OnlineDumpThreads(KernelCore& kernel, KProcess& process, int which, s64 seconds) {
+    struct Info {
+        u64 id;
+        s32 priority;
+        s32 core;
+        std::string name;
+        std::string state;
+        Kernel::Svc::ThreadContext context;
+        bool current;
+    };
+    std::vector<Info> infos;
+    KThread* const current = GetCurrentThreadPointer(kernel);
+    {
+        KScopedLightLock lk{process.GetListLock()};
+        for (auto& thread : process.GetThreadList()) {
+            infos.push_back({thread.GetThreadId(), thread.GetPriority(), thread.GetActiveCore(),
+                             Core::GetThreadName(&thread).value_or(""),
+                             Core::GetThreadState(&thread), thread.GetContext(),
+                             &thread == current});
+        }
+    }
+    LOG_INFO(Kernel_SVC, "[ONLINE] ===== thread dump {} ({} s after the NPLN lookup): {} threads =====",
+             which, seconds, infos.size());
+    for (const auto& info : infos) {
+        LOG_INFO(Kernel_SVC, "[ONLINE] t{} \"{}\" prio {} core {}: {}{}", info.id, info.name,
+                 info.priority, info.core, info.state, info.current ? " (dumping thread)" : "");
+        if (const std::string wait = Core::OnlineGetNote(false, info.id); !wait.empty()) {
+            LOG_INFO(Kernel_SVC, "[ONLINE]     last wait: {}", wait);
+        }
+        if (const std::string ipc = Core::OnlineGetNote(true, info.id); !ipc.empty()) {
+            LOG_INFO(Kernel_SVC, "[ONLINE]     last ipc: {}", ipc);
+        }
+        const auto frames = Core::GetBacktraceFromContext(&process, info.context);
+        for (size_t i = 0; i < std::min<size_t>(frames.size(), 16); ++i) {
+            LOG_INFO(Kernel_SVC, "[ONLINE]       #{} {}+{:#x} {}", i, frames[i].module,
+                     frames[i].offset, frames[i].name);
+        }
+    }
+    LOG_INFO(Kernel_SVC, "[ONLINE] ===== end of thread dump {} =====", which);
+}
+
+// [ONLINE] Once armed: note what this thread waits on, and write the dumps when it is time.
+static void OnlineWatch(KernelCore& kernel, KProcess& process, u32 imm,
+                        std::array<uint64_t, 8>& args) {
+    if (!Core::OnlineWatchActive()) {
+        return;
+    }
+    const u64 tid = GetCurrentThread(kernel).GetThreadId();
+    switch (imm) {
+    case 0x0B:
+        Core::OnlineNote(false, tid, fmt::format("SleepThread {} ns", static_cast<s64>(GetArg64(args, 0))));
+        break;
+    case 0x18:
+        Core::OnlineNote(false, tid,
+                         fmt::format("WaitSynchronization{} timeout {}",
+                                     OnlineHandleList(kernel, process, GetArg64(args, 1),
+                                                      static_cast<s32>(GetArg64(args, 2))),
+                                     static_cast<s64>(GetArg64(args, 3))));
+        break;
+    case 0x1A:
+        Core::OnlineNote(false, tid, fmt::format("ArbitrateLock address {:#x}", GetArg64(args, 1)));
+        break;
+    case 0x1C:
+        Core::OnlineNote(false, tid,
+                         fmt::format("WaitProcessWideKeyAtomic lock {:#x} key {:#x} timeout {}",
+                                     GetArg64(args, 0), GetArg64(args, 1),
+                                     static_cast<s64>(GetArg64(args, 3))));
+        break;
+    case 0x21:
+        Core::OnlineNote(false, tid, fmt::format("SendSyncRequest handle {:#x}", GetArg64(args, 0)));
+        break;
+    case 0x22:
+        Core::OnlineNote(false, tid,
+                         fmt::format("SendSyncRequestWithUserBuffer handle {:#x}", GetArg64(args, 2)));
+        break;
+    case 0x34:
+        Core::OnlineNote(false, tid,
+                         fmt::format("WaitForAddress {:#x} type {} value {} timeout {}",
+                                     GetArg64(args, 0), GetArg64(args, 1),
+                                     static_cast<s32>(GetArg64(args, 2)),
+                                     static_cast<s64>(GetArg64(args, 3))));
+        break;
+    case 0x43:
+        Core::OnlineNote(false, tid,
+                         fmt::format("ReplyAndReceive{} timeout {}",
+                                     OnlineHandleList(kernel, process, GetArg64(args, 1),
+                                                      static_cast<s32>(GetArg64(args, 2))),
+                                     static_cast<s64>(GetArg64(args, 4))));
+        break;
+    default:
+        break;
+    }
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    const s64 seconds =
+        (now - Core::g_online_dump_armed_ns.load(std::memory_order_relaxed)) / 1'000'000'000;
+    int done = Core::g_online_dumps_done.load(std::memory_order_relaxed);
+    if ((done == 0 && seconds >= 15) || (done == 1 && seconds >= 40)) {
+        if (Core::g_online_dumps_done.compare_exchange_strong(done, done + 1)) {
+            OnlineDumpThreads(kernel, process, done + 1, seconds);
+        }
+    }
+}
+
 void Call(Core::System& system, u32 imm) {
     auto& kernel = system.Kernel();
     auto& process = GetCurrentProcess(kernel);
     std::array<uint64_t, 8> args;
     kernel.CurrentPhysicalCore().SaveSvcArguments(process, args);
     GetCurrentThread(kernel).SetEnteredKernel();
+    if (Core::g_online_dump_armed_ns.load(std::memory_order_relaxed) != 0) {
+        OnlineWatch(kernel, process, imm, args);
+    }
     //kernel.EnterSVCProfile();
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),

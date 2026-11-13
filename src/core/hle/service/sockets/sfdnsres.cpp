@@ -3,10 +3,15 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "common/fs/path_util.h"
 #include "common/nextendo.h"
 #include "common/string_util.h"
 #include "common/swap.h"
@@ -114,6 +119,70 @@ static void RememberRedirectedHost(const std::vector<Network::AddrInfo>& address
     }
 }
 
+// Address of the online server. NX2_ONLINE_SERVER wins when set; otherwise the first line of
+// online_server.txt in the config folder (created with the default on first launch, so it can be
+// changed once by editing that one line); otherwise the built-in default.
+static constexpr const char* kDefaultOnlineServer = "2.29.165.22";
+
+static std::string OnlineServerAddress() {
+    static const std::string address = []() -> std::string {
+        if (const char* env = std::getenv("NX2_ONLINE_SERVER"); env != nullptr && *env != '\0') {
+            return std::string(env);
+        }
+        const auto file =
+            Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "online_server.txt";
+        std::string value;
+        {
+            std::ifstream in(file);
+            std::string line;
+            while (std::getline(in, line)) {
+                const auto first = line.find_first_not_of(" \t\r\n");
+                if (first == std::string::npos) {
+                    continue;
+                }
+                const auto last = line.find_last_not_of(" \t\r\n");
+                value = line.substr(first, last - first + 1);
+                break;
+            }
+        }
+        if (value.empty()) {
+            value = kDefaultOnlineServer;
+            std::ofstream out(file);
+            if (out) {
+                out << value << "\n";
+            }
+        }
+        LOG_INFO(Network, "[ONLINE] server address {} (file {})", value, file.string());
+        return value;
+    }();
+    return address;
+}
+
+// Online Switch 2: the game's NPLN servers (*.npln.srv.nintendo.net) go to our own server
+// instead of being blocked. Address from NX2_ONLINE_SERVER, else this PC (127.0.0.1).
+static std::string RedirectOnlineHost(const std::string& raw_host) {
+    // The game leaves a "%" where the console (nsd) writes its environment: "lp1" on retail.
+    std::string host = raw_host;
+    for (std::size_t at = host.find('%'); at != std::string::npos; at = host.find('%', at + 3)) {
+        host.replace(at, 1, "lp1");
+    }
+    const auto ends_with = [&host](std::string_view suffix) {
+        return host.size() > suffix.size() &&
+               host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    // NPLN servers, and the NAT-check servers Pia asks before it links players (nncs1 / nncs2).
+    const bool npln = ends_with(".npln.srv.nintendo.net");
+    const bool nncs = host.rfind("nncs", 0) == 0 && ends_with(".srv.nintendo.net");
+    const bool pserver = host.rfind("g", 0) == 0 && ends_with(".p.srv.nintendo.net");
+    if (!npln && !nncs && !pserver) {
+        return host;
+    }
+    const std::string target = OnlineServerAddress();
+    LOG_INFO(Network, "[ONLINE] {} -> {}", host, target);
+    Core::OnlineArmThreadDump();
+    return target;
+}
+
 static NetDbError GetAddrInfoErrorToNetDbError(GetAddrInfoError result) {
     // These combinations have been verified on console (but are not
     // exhaustive).
@@ -212,7 +281,7 @@ static std::pair<u32, GetAddrInfoError> GetHostByNameRequestImpl(HLERequestConte
         parameters.use_nsd_resolve, parameters.cancel_handle, parameters.process_id);
 
     const auto host_buffer = ctx.ReadBuffer(0);
-    std::string host = Common::StringFromBuffer(host_buffer);
+    std::string host = RedirectOnlineHost(Common::StringFromBuffer(host_buffer));
     if (Common::Nextendo::OnlinePlayActive()) {
         host = Nextendo::ExpandNsdHost(std::move(host));
     }
@@ -318,6 +387,36 @@ static std::vector<u8> SerializeAddrInfo(const std::vector<Network::AddrInfo>& v
     return data;
 }
 
+// A console's getaddrinfo answers with the socket type and protocol asked for in the hints; the
+// host's leaves them at 0 (Windows always does), and games then find no usable address.
+// Switch values: SOCK_STREAM 1, SOCK_DGRAM 2, IPPROTO_TCP 6, IPPROTO_UDP 17.
+static void FillConsoleSocketKinds(std::vector<Network::AddrInfo>& results, u32 hint_socktype,
+                                   u32 hint_protocol) {
+    const bool type_hinted = hint_socktype == 1 || hint_socktype == 2;
+    const Network::Type wanted_type =
+        hint_socktype == 2 ? Network::Type::DGRAM : Network::Type::STREAM;
+    std::erase_if(results, [&](const Network::AddrInfo& info) {
+        return type_hinted && info.socket_type != Network::Type::Unspecified &&
+               info.socket_type != wanted_type;
+    });
+    for (auto& info : results) {
+        if (info.socket_type == Network::Type::Unspecified) {
+            info.socket_type = wanted_type;
+        }
+        if (info.protocol == Network::Protocol::Unspecified ||
+            info.protocol == Network::Protocol::IP) {
+            if (hint_protocol == 6) {
+                info.protocol = Network::Protocol::TCP;
+            } else if (hint_protocol == 17) {
+                info.protocol = Network::Protocol::UDP;
+            } else {
+                info.protocol = info.socket_type == Network::Type::DGRAM ? Network::Protocol::UDP
+                                                                         : Network::Protocol::TCP;
+            }
+        }
+    }
+}
+
 static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext& ctx,
                                                                 u64 program_id) {
     struct InputParameters {
@@ -339,7 +438,7 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
     // before looking up.
 
     const auto host_buffer = ctx.ReadBuffer(0);
-    std::string host = Common::StringFromBuffer(host_buffer);
+    std::string host = RedirectOnlineHost(Common::StringFromBuffer(host_buffer));
     if (Common::Nextendo::OnlinePlayActive()) {
         host = Nextendo::ExpandNsdHost(std::move(host));
     }
@@ -357,13 +456,32 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
         service = Common::StringFromBuffer(service_buffer);
     }
 
-    // Serialized hints are also passed in a buffer, but are ignored for now.
+    // Serialized hints come in the third buffer, big-endian: magic 0xBEEFCAFE, ai_flags,
+    // ai_family, ai_socktype, ai_protocol (read without the magic if it is missing).
+    u32 hint_socktype = 0;
+    u32 hint_protocol = 0;
+    if (ctx.CanReadBuffer(2)) {
+        const std::span<const u8> hints_buffer = ctx.ReadBuffer(2);
+        const auto read_be = [&hints_buffer](std::size_t offset) -> u32 {
+            if (offset + 4 > hints_buffer.size()) {
+                return 0;
+            }
+            return (u32{hints_buffer[offset]} << 24) | (u32{hints_buffer[offset + 1]} << 16) |
+                   (u32{hints_buffer[offset + 2]} << 8) | u32{hints_buffer[offset + 3]};
+        };
+        const std::size_t base = read_be(0) == 0xBEEFCAFE ? 4 : 0;
+        hint_socktype = read_be(base + 8);
+        hint_protocol = read_be(base + 12);
+    }
 
     auto res_v = Network::GetAddressInfo(redirect.value_or(host), service);
     if (auto* res = std::get_if<std::vector<Network::AddrInfo>>(&res_v)) {
         if (redirect) {
             RememberRedirectedHost(*res, host);
         }
+        FillConsoleSocketKinds(*res, hint_socktype, hint_protocol);
+        LOG_INFO(Network, "[ONLINE] getaddrinfo {} : hints socktype={} protocol={}, {} result(s)",
+                 host, hint_socktype, hint_protocol, res->size());
         const std::vector<u8> data = SerializeAddrInfo(*res, host);
         const u32 data_size = u32(data.size());
         ctx.WriteBuffer(data, 0);

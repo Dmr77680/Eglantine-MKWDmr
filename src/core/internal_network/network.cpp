@@ -5,8 +5,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <thread>
+#include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -15,6 +22,8 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <icmpapi.h>
 #else
 #include <arpa/inet.h>
 #include <errno.h>
@@ -938,8 +947,128 @@ Errno Socket::SetSockOpt(SOCKET fd_so, int level, int option, T value) {
     return GetAndLogLastError();
 }
 
+#ifdef _WIN32
+namespace {
+struct IcmpReply {
+    std::vector<u8> data;
+    sockaddr_in from{};
+};
+std::mutex icmp_mutex;
+std::map<SOCKET, std::deque<IcmpReply>> icmp_replies;
+
+u16 InternetChecksum(const u8* d, size_t n) {
+    u32 sum = 0;
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        sum += (static_cast<u32>(d[i]) << 8) | d[i + 1];
+    }
+    if (n & 1) {
+        sum += static_cast<u32>(d[n - 1]) << 8;
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    return static_cast<u16>(~sum);
+}
+
+void StartIcmpEcho(SOCKET s, u32 dest_net_order, std::vector<u8> msg) {
+    std::thread([s, dest_net_order, msg = std::move(msg)] {
+        HANDLE h = IcmpCreateFile();
+        if (h == INVALID_HANDLE_VALUE) {
+            LOG_WARNING(Network, "[ONLINE] icmp echo: IcmpCreateFile failed {}", GetLastError());
+            return;
+        }
+        const DWORD plen = msg.size() > 8 ? static_cast<DWORD>(msg.size() - 8) : 0;
+        std::vector<u8> buf(sizeof(ICMP_ECHO_REPLY) + plen + 64);
+        const DWORD n = IcmpSendEcho(h, dest_net_order, plen ? const_cast<u8*>(msg.data() + 8) : nullptr,
+                                     static_cast<WORD>(plen), nullptr, buf.data(),
+                                     static_cast<DWORD>(buf.size()), 1500);
+        u8 ttl = 64;
+        if (n > 0) {
+            ttl = reinterpret_cast<ICMP_ECHO_REPLY*>(buf.data())->Options.Ttl;
+        }
+        IcmpCloseHandle(h);
+        LOG_INFO(Network, "[ONLINE] icmp echo seq={} -> {}", (msg.size() >= 8 ? (msg[6] << 8 | msg[7]) : 0),
+                 n > 0 ? "reply" : "no reply");
+        if (n == 0) {
+            return;
+        }
+        std::vector<u8> pkt(20 + msg.size());
+        pkt[0] = 0x45;
+        pkt[2] = static_cast<u8>(pkt.size() >> 8);
+        pkt[3] = static_cast<u8>(pkt.size());
+        pkt[8] = ttl;
+        pkt[9] = 1;
+        std::memcpy(&pkt[12], &dest_net_order, 4);
+        std::memcpy(&pkt[20], msg.data(), msg.size());
+        pkt[20] = 0; // echo reply
+        pkt[22] = pkt[23] = 0;
+        const u16 ic = InternetChecksum(&pkt[20], msg.size());
+        pkt[22] = static_cast<u8>(ic >> 8);
+        pkt[23] = static_cast<u8>(ic);
+        const u16 hc = InternetChecksum(pkt.data(), 20);
+        pkt[10] = static_cast<u8>(hc >> 8);
+        pkt[11] = static_cast<u8>(hc);
+        IcmpReply reply;
+        reply.data = std::move(pkt);
+        reply.from.sin_family = AF_INET;
+        reply.from.sin_addr.s_addr = dest_net_order;
+        std::lock_guard lock{icmp_mutex};
+        const auto it = icmp_replies.find(s);
+        if (it != icmp_replies.end()) {
+            it->second.push_back(std::move(reply));
+        }
+    }).detach();
+}
+
+bool PopIcmpReply(SOCKET s, std::span<u8> message, sockaddr_in& from, s32& size) {
+    std::lock_guard lock{icmp_mutex};
+    const auto it = icmp_replies.find(s);
+    if (it == icmp_replies.end() || it->second.empty()) {
+        return false;
+    }
+    IcmpReply reply = std::move(it->second.front());
+    it->second.pop_front();
+    static const bool no_header = std::getenv("NX2_ICMP_NOHDR") != nullptr;
+    if (no_header && reply.data.size() > 20) {
+        reply.data.erase(reply.data.begin(), reply.data.begin() + 20);
+    }
+    const size_t n = std::min(reply.data.size(), message.size());
+    std::memcpy(message.data(), reply.data.data(), n);
+    from = reply.from;
+    size = static_cast<s32>(n);
+    LOG_INFO(Network, "[ONLINE] icmp reply given to the game: {} bytes (game buffer {} bytes, {})",
+             n, message.size(), no_header ? "without IP header" : "with IP header");
+    return true;
+}
+} // namespace
+#endif
+
+#ifdef _WIN32
+// [ONLINE] Windows only delivers data to a raw socket once it is bound; a console does not need it.
+static void BindRawSocketOnce(SOCKET raw_fd) {
+    static std::mutex bound_mutex;
+    static std::set<SOCKET> bound;
+    std::lock_guard lock{bound_mutex};
+    if (!bound.insert(raw_fd).second) {
+        return;
+    }
+    sockaddr_in any{};
+    any.sin_family = AF_INET;
+    any.sin_addr.s_addr = htonl(INADDR_ANY);
+    any.sin_port = 0;
+    if (bind(raw_fd, reinterpret_cast<const sockaddr*>(&any), sizeof(any)) == 0) {
+        LOG_INFO(Network, "[ONLINE] raw socket bound (0.0.0.0)");
+    } else {
+        LOG_WARNING(Network, "[ONLINE] raw socket bind failed: {}", WSAGetLastError());
+    }
+}
+#endif
+
 Errno Socket::Initialize(Domain domain, Type type, Protocol protocol) {
     fd = socket(TranslateDomainToNative(domain), TranslateTypeToNative(type), TranslateProtocolToNative(protocol));
+    LOG_INFO(Network, "[ONLINE] new host socket: domain={} type={} protocol={} ({})",
+             static_cast<u32>(domain), static_cast<u32>(type), static_cast<u32>(protocol),
+             fd != INVALID_SOCKET ? "ok" : "failed");
     if (fd != INVALID_SOCKET) {
         socket_type = type;
         return Errno::SUCCESS;
@@ -993,6 +1122,13 @@ std::pair<SocketBase::AcceptResult, Errno> Socket::Accept() {
 }
 
 Errno Socket::Connect(SockAddrIn addr_in) {
+    {
+        static std::atomic<int> connects{0};
+        if (connects.fetch_add(1) < 60) {
+            LOG_INFO(Network, "[ONLINE] connect to {}.{}.{}.{}:{}", addr_in.ip[0], addr_in.ip[1],
+                     addr_in.ip[2], addr_in.ip[3], addr_in.portno);
+        }
+    }
     // The guest's own address decides; the configured server it may then go to is the user's.
     if (!LocalRedirect::Allowed(addr_in)) {
         LOG_DEBUG(Network, "Host redirect: connection to {}.{}.{}.{}:{} refused (loopback only)",
@@ -1137,6 +1273,15 @@ std::pair<s32, Errno> Socket::Recv(int flags, std::span<u8> message) {
     ASSERT(message.size() < static_cast<size_t>((std::numeric_limits<int>::max)()));
 
     return Transfer(flags, [&](int host_flags) -> std::pair<s32, Errno> {
+#ifdef _WIN32
+        {
+            sockaddr_in from{};
+            s32 got = 0;
+            if (PopIcmpReply(fd, message, from, got)) {
+                return {got, Errno::SUCCESS};
+            }
+        }
+#endif
         const auto result = recv(fd, reinterpret_cast<char*>(message.data()),
                                  static_cast<int>(message.size()), host_flags);
         if (result != SOCKET_ERROR) {
@@ -1157,16 +1302,76 @@ std::pair<s32, Errno> Socket::RecvFrom(int flags, std::span<u8> message, SockAdd
         socklen_t* const p_addrlen = addr ? &addrlen : nullptr;
         sockaddr* const p_addr_in = addr ? reinterpret_cast<sockaddr*>(&addr_in) : nullptr;
 
+#ifdef _WIN32
+        {
+            sockaddr_in from{};
+            s32 got = 0;
+            if (PopIcmpReply(fd, message, from, got)) {
+                if (addr) {
+                    *addr = TranslateToSockAddrIn(from, sizeof(from));
+                }
+                return {got, Errno::SUCCESS};
+            }
+        }
+#endif
         const auto result =
             recvfrom(fd, reinterpret_cast<char*>(message.data()),
                      static_cast<int>(message.size()), host_flags, p_addr_in, p_addrlen);
         if (result != SOCKET_ERROR) {
             if (addr) {
                 *addr = TranslateToSockAddrIn(addr_in, addrlen);
+                static std::atomic<int> udp_recvs{0};
+                if (udp_recvs.fetch_add(1) < 20000) {
+                    std::string head;
+                    for (int i = 0; i < result && i < 20; ++i) {
+                        head += fmt::format("{:02x}", message[i]);
+                    }
+                    LOG_INFO(Network, "[ONLINE] udp recv: {} bytes from {}.{}.{}.{}:{} data={}",
+                             result, addr->ip[0], addr->ip[1], addr->ip[2], addr->ip[3],
+                             addr->portno, head);
+                }
             }
             return {static_cast<s32>(result), Errno::SUCCESS};
         }
 
+#ifdef _WIN32
+        // [ONLINE] Windows will not receive on a raw socket that was never bound; a console does.
+        if (WSAGetLastError() == WSAEINVAL) {
+            int sock_type = 0;
+            int sock_type_len = sizeof(sock_type);
+            if (getsockopt(fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&sock_type),
+                           &sock_type_len) == 0 &&
+                sock_type == SOCK_RAW) {
+                BindRawSocketOnce(fd);
+                const auto retry =
+                    recvfrom(fd, reinterpret_cast<char*>(message.data()),
+                             static_cast<int>(message.size()), host_flags, p_addr_in, p_addrlen);
+                if (retry != SOCKET_ERROR) {
+                    if (addr) {
+                        *addr = TranslateToSockAddrIn(addr_in, addrlen);
+                    }
+                    static std::atomic<int> raw_ok{0};
+                    if (raw_ok.fetch_add(1) < 10) {
+                        std::string head;
+                        for (int i = 0; i < retry && i < 32; ++i) {
+                            head += fmt::format("{:02x}", message[i]);
+                        }
+                        LOG_INFO(Network, "[ONLINE] raw receive: {} bytes data={}", retry, head);
+                    }
+                    return {static_cast<s32>(retry), Errno::SUCCESS};
+                }
+                if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                    return {-1, Errno::AGAIN};
+                }
+                static std::atomic<int> raw_receives{0};
+                if (raw_receives.fetch_add(1) < 3) {
+                    LOG_INFO(Network, "[ONLINE] raw receive: no data yet (error {})",
+                             WSAGetLastError());
+                }
+                return {-1, Errno::AGAIN};
+            }
+        }
+#endif
         return {-1, GetAndLogLastError()};
     });
 }
@@ -1258,6 +1463,55 @@ std::pair<s32, Errno> Socket::SendTo(u32 flags, std::span<const u8> message,
         to = &host_addr_in;
     }
 
+    {
+        int sock_type = 0;
+        socklen_t sock_type_len = sizeof(sock_type);
+        if (getsockopt(fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&sock_type),
+                       &sock_type_len) == 0 &&
+            sock_type == SOCK_RAW) {
+#ifdef _WIN32
+            BindRawSocketOnce(fd);
+            if (addr && !message.empty() && message[0] == 8) {
+                {
+                    std::lock_guard lock{icmp_mutex};
+                    icmp_replies.try_emplace(fd);
+                }
+                u32 dest;
+                std::memcpy(&dest, addr->ip.data(), 4);
+                StartIcmpEcho(fd, dest, std::vector<u8>(message.begin(), message.end()));
+            }
+#endif
+            static std::atomic<int> raw_sends{0};
+            if (raw_sends.fetch_add(1) < 20) {
+                std::string head;
+                for (std::size_t i = 0; i < message.size() && i < 24; ++i) {
+                    head += fmt::format("{:02x}", message[i]);
+                }
+                if (addr) {
+                    LOG_INFO(Network, "[ONLINE] raw send: {} bytes to {}.{}.{}.{}:{} data={}",
+                             message.size(), addr->ip[0], addr->ip[1], addr->ip[2], addr->ip[3],
+                             addr->portno, head);
+                } else {
+                    LOG_INFO(Network, "[ONLINE] raw send: {} bytes (no address) data={}",
+                             message.size(), head);
+                }
+            }
+        }
+    }
+
+    if (addr && addr->portno != 0) {
+        static std::atomic<int> udp_sends{0};
+        if (udp_sends.fetch_add(1) < 20000) {
+            std::string head;
+            for (std::size_t i = 0; i < message.size() && i < 20; ++i) {
+                head += fmt::format("{:02x}", message[i]);
+            }
+            LOG_INFO(Network, "[ONLINE] udp send: {} bytes to {}.{}.{}.{}:{} data={}",
+                     message.size(), addr->ip[0], addr->ip[1], addr->ip[2], addr->ip[3],
+                     addr->portno, head);
+        }
+    }
+
     return Transfer(static_cast<int>(flags), [&](int host_flags) -> std::pair<s32, Errno> {
         const auto result = sendto(fd, reinterpret_cast<const char*>(message.data()),
                                    static_cast<int>(message.size()), host_flags, to, to_len);
@@ -1270,6 +1524,12 @@ std::pair<s32, Errno> Socket::SendTo(u32 flags, std::span<const u8> message,
 }
 
 Errno Socket::Close() {
+#ifdef _WIN32
+    {
+        std::lock_guard lock{icmp_mutex};
+        icmp_replies.erase(fd);
+    }
+#endif
     [[maybe_unused]] const int result = closesocket(fd);
     if (result != 0) {
         LOG_WARNING(Network, "closesocket failed, socket may already be closed");

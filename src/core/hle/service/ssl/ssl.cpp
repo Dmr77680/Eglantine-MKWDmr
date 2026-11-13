@@ -3,6 +3,8 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <string>
+
 #include "common/string_util.h"
 
 #include "core/core.h"
@@ -20,6 +22,21 @@
 #include "core/internal_network/sockets.h"
 
 namespace Service::SSL {
+
+namespace {
+/// Comma-separated certificate ids, for the online logs.
+template <typename Ids>
+std::string DescribeCertificateIds(const Ids& ids) {
+    std::string out;
+    for (const auto id : ids) {
+        if (!out.empty()) {
+            out += ',';
+        }
+        out += std::to_string(static_cast<s32>(id));
+    }
+    return out;
+}
+} // namespace
 
 // This is nn::ssl::sf::CertificateFormat
 enum class CertificateFormat : u32 {
@@ -701,15 +718,23 @@ class ISslServiceForSystem final : public ServiceFramework<ISslServiceForSystem>
         Result GetCertificates(Out<u32> out_num_entries,
                                OutBuffer<BufferAttr_HipcMapAlias> out_buffer,
                                InArray<CaCertificateId, BufferAttr_HipcMapAlias> certificate_ids) {
-            LOG_DEBUG(Service_SSL, "called");
-            R_RETURN(cert_store.GetCertificates(out_num_entries, out_buffer, certificate_ids));
+            u32* const out_count = out_num_entries;
+            const Result result = cert_store.GetCertificates(out_count, out_buffer, certificate_ids);
+            LOG_INFO(Service_SSL, "[ONLINE] GetCertificates ids=[{}] buffer={} -> {} entries, result={:#x}",
+                     DescribeCertificateIds(certificate_ids), out_buffer.size(), *out_count,
+                     result.raw);
+            R_RETURN(result);
         }
 
         Result GetCertificateBufSize(
             Out<u32> out_size, InArray<CaCertificateId, BufferAttr_HipcMapAlias> certificate_ids) {
-            LOG_DEBUG(Service_SSL, "called");
-            u32 num_entries;
-            R_RETURN(cert_store.GetCertificateBufSize(out_size, &num_entries, certificate_ids));
+            u32 num_entries = 0;
+            u32* const out_bytes = out_size;
+            const Result result =
+                cert_store.GetCertificateBufSize(out_bytes, &num_entries, certificate_ids);
+            LOG_INFO(Service_SSL, "[ONLINE] GetCertificateBufSize ids=[{}] -> {} entries, {} bytes, result={:#x}",
+                     DescribeCertificateIds(certificate_ids), num_entries, *out_bytes, result.raw);
+            R_RETURN(result);
         }
 
         Result DebugIoctl() {

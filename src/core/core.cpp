@@ -8,6 +8,10 @@
 #include <memory>
 #include <new>
 #include <utility>
+#include <chrono>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 #include "game_settings.h"
 #include "common/cpu_features.h"
@@ -90,6 +94,42 @@ namespace Core {
 std::atomic<u64> g_nx2_present_count{};
 static_assert(std::atomic<u64>::is_always_lock_free);
 std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns{};
+
+std::atomic<s64> g_online_dump_armed_ns{};
+std::atomic<int> g_online_dumps_done{};
+
+namespace {
+std::mutex g_online_notes_mutex;
+std::unordered_map<u64, std::string> g_online_wait_notes;
+std::unordered_map<u64, std::string> g_online_ipc_notes;
+} // Anonymous namespace
+
+void OnlineArmThreadDump() {
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 expected = 0;
+    if (g_online_dump_armed_ns.compare_exchange_strong(expected, now)) {
+        LOG_INFO(Core, "[ONLINE] thread dumps armed: they will be written in 15 s and 40 s");
+    }
+}
+
+bool OnlineWatchActive() {
+    return g_online_dump_armed_ns.load(std::memory_order_relaxed) != 0 &&
+           g_online_dumps_done.load(std::memory_order_relaxed) < 2;
+}
+
+void OnlineNote(bool ipc, u64 thread_id, std::string text) {
+    std::scoped_lock lk{g_online_notes_mutex};
+    (ipc ? g_online_ipc_notes : g_online_wait_notes)[thread_id] = std::move(text);
+}
+
+std::string OnlineGetNote(bool ipc, u64 thread_id) {
+    std::scoped_lock lk{g_online_notes_mutex};
+    const auto& notes = ipc ? g_online_ipc_notes : g_online_wait_notes;
+    const auto it = notes.find(thread_id);
+    return it != notes.end() ? it->second : std::string{};
+}
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path) {
