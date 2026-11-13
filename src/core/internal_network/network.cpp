@@ -986,7 +986,7 @@ bool PopIcmpReply(SOCKET s, std::span<u8> message, sockaddr_in& from, s32& size)
     if (no_header && reply.data.size() > 20) {
         reply.data.erase(reply.data.begin(), reply.data.begin() + 20);
     }
-    const size_t n = std::min(reply.data.size(), message.size());
+    const size_t n = (std::min)(reply.data.size(), message.size());
     std::memcpy(message.data(), reply.data.data(), n);
     from = reply.from;
     size = static_cast<s32>(n);
