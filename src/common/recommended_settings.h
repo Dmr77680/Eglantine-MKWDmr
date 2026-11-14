@@ -39,7 +39,7 @@ void ForEachRecommendedSetting(Values& settings, Func&& func) {
     entry(settings.native_pipeline_wait_ms, 8);
     entry(settings.precache_shaders, PrecacheShaders::Off);
     entry(settings.use_video_framerate, false);
-    entry(settings.mkw_30fps, false);
+    entry(settings.mkw_30fps, true);
     entry(settings.mkw_dynamic_fps, false);
     entry(settings.hyrule_dynamic_fps, false);
     entry(settings.hyrule_30fps, false);
